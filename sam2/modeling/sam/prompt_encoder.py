@@ -5,22 +5,71 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-PromptEncoder for SAM2 (Segment Anything Model 2)
+Prompt Encoder for SAM2 - User Interaction Interface
 
-This module implements the prompt encoding component of SAM2, which is responsible for
-converting various types of user inputs (prompts) into embeddings that can be processed
-by the mask decoder. The encoder handles three main types of prompts:
+This module implements the prompt encoding component of SAM2, which serves as the critical
+interface between user interactions and the model's internal processing. The encoder transforms
+various types of human inputs into structured embeddings that the mask decoder can interpret
+to generate precise segmentation masks.
 
-1. Point prompts: Individual points with positive/negative labels for inclusion/exclusion
-2. Box prompts: Bounding boxes that define regions of interest
-3. Mask prompts: Dense pixel-wise masks that provide detailed spatial information
+Core Functionality:
 
-The encoder produces two types of outputs:
-- Sparse embeddings: For point and box prompts (discrete spatial locations)
-- Dense embeddings: For mask prompts (continuous spatial information)
+The PromptEncoder handles three fundamental types of user prompts:
 
-This design allows SAM2 to handle flexible user interactions while maintaining
-computational efficiency through appropriate representations.
+1. **Point Prompts**: Individual clicks with semantic labels
+   - Positive points (label=1): "Include this region in the mask"
+   - Negative points (label=0): "Exclude this region from the mask"  
+   - Box corners (labels=2,3): "Segment the object within this box"
+   - Encoded with position embeddings and semantic type embeddings
+
+2. **Box Prompts**: Rectangular bounding boxes defining regions of interest
+   - Represented as two corner points with special labels (2, 3)
+   - Provides strong spatial constraints for object segmentation
+   - Automatically converted to point format for unified processing
+
+3. **Mask Prompts**: Dense pixel-wise annotations
+   - Previous segmentation masks for iterative refinement
+   - Dense spatial information encoded through convolutional networks
+   - Enables precise boundary adjustments and multi-step workflows
+
+Architecture Design:
+
+**Sparse Pathway (Points/Boxes)**:
+- Position-aware embeddings using Random Fourier Features
+- Learnable type embeddings for different point semantics
+- Efficient representation for discrete spatial locations
+- Direct integration with transformer attention mechanisms
+
+**Dense Pathway (Masks)**:
+- Convolutional encoding preserving spatial structure
+- Progressive downsampling to match image embedding resolution
+- Layer normalization for stable feature representations
+- Dense feature maps compatible with cross-attention operations
+
+**Unified Output**:
+- Sparse embeddings: (N_points, embed_dim) for discrete prompts
+- Dense embeddings: (embed_dim, H, W) for continuous spatial information
+- Consistent dimensionality enabling seamless decoder integration
+
+Key Benefits:
+
+- **Flexibility**: Supports diverse interaction modalities within unified framework
+- **Efficiency**: Optimized representations for different prompt characteristics  
+- **Consistency**: Uniform embedding space for heterogeneous inputs
+- **Scalability**: Handles variable numbers of prompts without architectural changes
+- **Interactivity**: Enables iterative refinement through multi-step prompt sequences
+
+Applications in SAM2:
+
+- **Interactive Segmentation**: Real-time mask generation from user clicks
+- **Bounding Box Segmentation**: Automatic object segmentation within specified regions
+- **Mask Refinement**: Iterative improvement of segmentation boundaries
+- **Multi-Modal Interaction**: Combination of different prompt types for complex scenarios
+- **Video Propagation**: Temporal consistency through mask prompt propagation
+
+The encoder's design enables SAM2's signature "segment anything" capability by providing
+a robust and flexible interface that can interpret diverse user intentions and translate
+them into actionable information for the segmentation pipeline.
 """
 
 from typing import Optional, Tuple, Type
@@ -35,17 +84,38 @@ from sam2.modeling.sam2_utils import LayerNorm2d
 
 class PromptEncoder(nn.Module):
     """
-    Encodes different types of prompts (points, boxes, masks) into embeddings for SAM2.
+    Unified encoder for diverse prompt types in SAM2 interactive segmentation.
     
-    This encoder is a crucial component that bridges user interactions with the model's
-    internal representations. It transforms human-interpretable prompts into high-dimensional
-    embeddings that the mask decoder can process to generate accurate segmentation masks.
+    This class serves as the crucial interface between user interactions and SAM2's
+    internal processing pipeline. It transforms heterogeneous user inputs (points,
+    boxes, masks) into structured embeddings that the mask decoder can interpret
+    to generate accurate segmentation masks.
     
-    Key Design Principles:
-    - Unified interface for heterogeneous prompt types
-    - Positional encoding to preserve spatial relationships
-    - Separate pathways for sparse (point/box) and dense (mask) prompts
-    - Learnable embeddings for different prompt semantics
+    The encoder implements separate processing pathways optimized for different
+    prompt characteristics:
+    
+    **Sparse Prompts (Points/Boxes)**:
+    - Efficient encoding of discrete spatial locations
+    - Position-aware embeddings with semantic type information
+    - Scalable to variable numbers of input points
+    - Direct compatibility with transformer attention mechanisms
+    
+    **Dense Prompts (Masks)**:
+    - Convolutional processing preserving spatial structure
+    - Progressive feature extraction and dimensionality alignment
+    - Support for iterative mask refinement workflows
+    - Dense spatial information for precise boundary control
+    
+    The unified design enables seamless combination of different prompt types,
+    supporting complex interactive scenarios while maintaining computational
+    efficiency and architectural consistency.
+    
+    Input Processing Flow:
+    1. **Coordinate Normalization**: Scale inputs to model's expected coordinate space
+    2. **Type-Specific Encoding**: Apply appropriate encoding pathway (sparse/dense)
+    3. **Position Integration**: Add spatial awareness through position embeddings  
+    4. **Embedding Generation**: Produce decoder-compatible representations
+    5. **Format Standardization**: Ensure consistent output dimensions and formats
     """
     
     def __init__(
@@ -57,23 +127,41 @@ class PromptEncoder(nn.Module):
         activation: Type[nn.Module] = nn.GELU,
     ) -> None:
         """
-        Initialize the PromptEncoder with the specified configuration.
+        Initialize the PromptEncoder with comprehensive configuration.
 
-        Arguments:
-          embed_dim (int): The prompts' embedding dimension. This should match the
-            dimension expected by the mask decoder for consistency.
-          image_embedding_size (tuple(int, int)): The spatial size of the
-            image embedding from the image encoder, as (H, W). Used for creating
-            appropriately sized positional encodings.
-          input_image_size (tuple(int, int)): The padded size of the image as input
-            to the image encoder, as (H, W). Used for coordinate normalization.
-          mask_in_chans (int): The number of hidden channels used for encoding
-            input masks. Controls the capacity of the mask encoding pathway.
-          activation (nn.Module): The activation function to use when encoding
-            input masks. Typically GELU for better gradient flow.
+        Args:
+            embed_dim (int): Embedding dimension for all prompt representations.
+                           Must match the dimension expected by the mask decoder to ensure
+                           compatibility in attention mechanisms. Typical values: 256, 512.
+                           
+            image_embedding_size (tuple[int, int]): Spatial dimensions (H, W) of image
+                                                   embeddings from the image encoder.
+                                                   Used to create properly sized position
+                                                   encodings and ensure spatial alignment.
+                                                   
+            input_image_size (tuple[int, int]): Padded image dimensions (H, W) as input
+                                               to the image encoder. Used for normalizing
+                                               prompt coordinates to the model's expected
+                                               coordinate space (typically [0, 1] range).
+                                               
+            mask_in_chans (int): Number of hidden channels in the mask encoding pathway.
+                                Controls the representational capacity for dense mask inputs.
+                                Higher values enable more detailed mask representations
+                                but increase computational cost.
+                                
+            activation (Type[nn.Module]): Activation function for mask encoding network.
+                                        GELU (default) provides smooth gradients and stable
+                                        training. ReLU offers computational efficiency.
+                                        
+        The initialization sets up:
+        - Position encoding system for spatial awareness
+        - Learnable embeddings for different prompt types
+        - Convolutional network for dense mask processing
+        - Coordinate transformation utilities
         """
         super().__init__()
-        # Store core dimensions for coordinate transformations and embedding sizing
+        
+        # Store core configuration parameters
         self.embed_dim = embed_dim
         self.input_image_size = input_image_size
         self.image_embedding_size = image_embedding_size

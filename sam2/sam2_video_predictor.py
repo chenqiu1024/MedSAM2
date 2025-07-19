@@ -4,6 +4,83 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+SAM2 Video Predictor - Interactive Video Object Tracking and Segmentation
+
+This module implements the SAM2VideoPredictor class, which extends SAM2 for video sequences
+with sophisticated memory mechanisms and temporal consistency. The predictor enables interactive
+video object tracking through sparse user annotations that propagate across frames automatically.
+
+Key Architectural Components:
+
+1. Memory Bank System:
+   - Conditioning Frames: User-annotated frames that provide strong object references
+   - Non-conditioning Frames: Automatically tracked frames with memory-based predictions
+   - Memory Attention: Cross-frame attention mechanism for temporal consistency
+   - Object Pointers: Compressed object representations for efficient memory usage
+
+2. Interactive Workflow:
+   - Initial annotation on one or more frames to define objects
+   - Automatic bidirectional propagation across the entire video
+   - Interactive correction through additional clicks or mask refinements
+   - Real-time updates with minimal recomputation
+
+3. Multi-Object Tracking:
+   - Simultaneous tracking of multiple objects with separate memory banks
+   - Object ID management and consistency across frames
+   - Non-overlapping mask constraints to prevent object merging
+   - Efficient batch processing for multiple objects
+
+4. Memory Management:
+   - Adaptive memory bank size with temporal locality
+   - CPU/GPU memory offloading for long videos
+   - Incremental updates for interactive corrections
+   - Efficient feature caching and reuse
+
+5. Temporal Consistency:
+   - Bidirectional propagation (forward and backward)
+   - Temporal attention across memory frames
+   - Smooth object boundaries across time
+   - Robust handling of occlusions and appearance changes
+
+Design Philosophy:
+- Minimize user interaction: sparse annotations propagate automatically
+- Temporal efficiency: leverage memory attention for consistency
+- Interactive refinement: easy correction of tracking errors
+- Scalability: handle long videos with multiple objects
+- Real-time performance: optimized for interactive applications
+
+Example Workflow:
+    # Initialize video predictor
+    predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-tiny")
+    
+    # Load video and initialize state
+    inference_state = predictor.init_state(video_path="video.mp4")
+    
+    # Add initial annotation on first frame
+    predictor.add_new_points_or_box(
+        inference_state, frame_idx=0, obj_id=1,
+        points=[[200, 300]], labels=[1]
+    )
+    
+    # Propagate across entire video
+    video_segments = {}
+    for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+        video_segments[frame_idx] = {obj_id: (mask_logits[i] > 0.0).cpu().numpy() 
+                                   for i, obj_id in enumerate(obj_ids)}
+    
+    # Add correction click on frame 50
+    predictor.add_new_points_or_box(
+        inference_state, frame_idx=50, obj_id=1,
+        points=[[250, 350]], labels=[1], clear_old_points=False
+    )
+    
+    # Re-propagate with corrections
+    for frame_idx, obj_ids, mask_logits in predictor.propagate_in_video(inference_state):
+        video_segments[frame_idx] = {obj_id: (mask_logits[i] > 0.0).cpu().numpy() 
+                                   for i, obj_id in enumerate(obj_ids)}
+"""
+
 import warnings
 from collections import OrderedDict
 
@@ -16,8 +93,72 @@ from sam2.utils.misc import concat_points, fill_holes_in_mask_scores, load_video
 
 
 class SAM2VideoPredictor(SAM2Base):
-    """The predictor class to handle user interactions and manage inference states."""
-
+    """
+    Interactive video object tracking and segmentation predictor using SAM2.
+    
+    This class extends the base SAM2 architecture with video-specific capabilities including
+    memory-based temporal modeling, interactive object tracking, and efficient multi-frame
+    processing. It provides a complete solution for video object segmentation with minimal
+    user interaction and robust temporal consistency.
+    
+    Core Capabilities:
+    
+    1. **Interactive Video Segmentation**: Users provide sparse annotations (clicks, boxes,
+       or masks) on one or more frames, and the model automatically propagates segmentation
+       across the entire video sequence with temporal consistency.
+    
+    2. **Memory-Based Tracking**: Utilizes a sophisticated memory bank system that stores
+       compressed representations of past frames and objects, enabling efficient attention-
+       based temporal modeling without processing all previous frames.
+    
+    3. **Multi-Object Support**: Simultaneously tracks multiple objects with separate memory
+       banks and object IDs, maintaining distinct representations while preventing overlap
+       through optional non-overlapping constraints.
+    
+    4. **Bidirectional Propagation**: Processes videos in both forward and backward directions
+       from conditioning frames, ensuring temporal consistency and handling cases where
+       objects appear or disappear mid-sequence.
+    
+    5. **Interactive Refinement**: Supports real-time correction of tracking errors through
+       additional user interactions. New clicks or mask inputs trigger efficient local
+       updates without full video reprocessing.
+    
+    Memory Architecture:
+    
+    - **Conditioning Frames**: Frames with direct user annotations that serve as strong
+      reference points for object appearance and location.
+    - **Non-Conditioning Frames**: Automatically processed frames that rely on memory
+      attention and temporal consistency for accurate segmentation.
+    - **Memory Bank**: Compressed storage of object representations from recent frames,
+      enabling efficient temporal attention computations.
+    - **Object Pointers**: Compact object representations derived from SAM output tokens
+      that capture object-specific information for cross-frame attention.
+    
+    Performance Optimizations:
+    
+    - **Feature Caching**: Image features are computed once and cached for reuse across
+      multiple objects and temporal processing steps.
+    - **Memory Offloading**: Support for CPU memory offloading to handle long videos
+      with limited GPU memory.
+    - **Incremental Processing**: New annotations trigger efficient local updates rather
+      than full video reprocessing.
+    - **Batch Operations**: Multiple objects are processed together when possible for
+      improved computational efficiency.
+    
+    State Management:
+    
+    The predictor maintains comprehensive inference state including:
+    - Video frames and metadata
+    - User annotations per object and frame
+    - Cached visual features
+    - Memory bank contents
+    - Tracking results and propagation status
+    - Object ID mappings and management
+    
+    This state-based design enables pause/resume functionality, interactive corrections,
+    and efficient memory management for production applications.
+    """
+    
     def __init__(
         self,
         fill_hole_area=0,
@@ -33,11 +174,48 @@ class SAM2VideoPredictor(SAM2Base):
         add_all_frames_to_correct_as_cond=False,
         **kwargs,
     ):
+        """
+        Initialize the SAM2 video predictor with configuration options.
+        
+        Args:
+            fill_hole_area (int): Maximum area of holes to fill in output masks.
+                If > 0, small holes up to this area (in pixels) will be filled
+                to improve mask connectivity. Default 0 (no hole filling).
+                
+            non_overlap_masks (bool): Whether to enforce non-overlapping constraints
+                on multi-object masks. When True, prevents different objects from
+                having overlapping segmentation regions. Default False.
+                
+            clear_non_cond_mem_around_input (bool): Whether to clear memory bank
+                entries for surrounding frames when adding correction clicks.
+                This helps remove outdated information but may reduce temporal
+                consistency. Only applies to single-object tracking unless
+                clear_non_cond_mem_for_multi_obj is also True. Default False.
+                
+            clear_non_cond_mem_for_multi_obj (bool): Whether to extend memory
+                clearing to multi-object scenarios. Only effective when
+                clear_non_cond_mem_around_input is True. Default False.
+                
+            add_all_frames_to_correct_as_cond (bool): Whether frames receiving
+                correction clicks should be added to the conditioning frame list.
+                True: correction frames become conditioning frames for stronger reference.
+                False: only initial annotation frames serve as conditioning frames.
+                Default False.
+                
+            **kwargs: Additional arguments passed to the parent SAM2Base class,
+                     including model architecture parameters and device settings.
+        """
         super().__init__(**kwargs)
+        
+        # Post-processing configuration
         self.fill_hole_area = fill_hole_area
         self.non_overlap_masks = non_overlap_masks
+        
+        # Memory management configuration for interactive corrections
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
+        
+        # Conditioning frame management
         self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
 
     @torch.inference_mode()
@@ -48,8 +226,58 @@ class SAM2VideoPredictor(SAM2Base):
         offload_state_to_cpu=False,
         async_loading_frames=False,
     ):
-        """Initialize an inference state."""
-        compute_device = self.device  # device of the model
+        """
+        Initialize inference state for a video sequence.
+        
+        This method sets up the complete state management system for video tracking,
+        including video loading, memory management, object tracking structures, and
+        performance optimizations. The inference state serves as the central data
+        structure that persists throughout the entire tracking session.
+        
+        The initialization process:
+        1. Loads and preprocesses all video frames
+        2. Sets up memory management strategies (CPU/GPU offloading)
+        3. Initializes data structures for multi-object tracking
+        4. Prepares caching systems for efficient processing
+        5. Warms up the model with the first frame
+        
+        Args:
+            video_path (str): Path to the video file or directory containing frames.
+                Supports common video formats (mp4, avi, mov) or image sequences.
+                
+            offload_video_to_cpu (bool): Whether to store video frames in CPU memory.
+                True: Saves GPU memory with minimal performance overhead.
+                False: Keeps frames on GPU for faster access (default).
+                Recommended for long videos or limited GPU memory.
+                
+            offload_state_to_cpu (bool): Whether to store inference state in CPU memory.
+                True: Significantly reduces GPU memory usage but lowers tracking FPS.
+                False: Keeps state on GPU for maximum performance (default).
+                Trade-off: memory vs speed (e.g., 27→24 FPS for one object, 24→21 for two).
+                
+            async_loading_frames (bool): Whether to load video frames asynchronously.
+                True: Enables background loading for better I/O performance.
+                False: Synchronous loading (default).
+                Useful for large videos or slower storage systems.
+                
+        Returns:
+            dict: Comprehensive inference state containing:
+                - Video data and metadata
+                - Memory management settings  
+                - Object tracking structures
+                - Feature caches and buffers
+                - State tracking and control flags
+                
+        Note:
+            The returned inference state must be passed to all subsequent tracking
+            operations. It maintains the complete session context and enables
+            pause/resume functionality for interactive applications.
+        """
+        # Get model's compute device for tensor operations
+        compute_device = self.device
+        
+        # Load and preprocess video frames to model input format
+        # Handles various video formats and automatically resizes to model input size
         images, video_height, video_width = load_video_frames(
             video_path=video_path,
             image_size=self.image_size,
@@ -57,57 +285,89 @@ class SAM2VideoPredictor(SAM2Base):
             async_loading_frames=async_loading_frames,
             compute_device=compute_device,
         )
+        
+        # Initialize the comprehensive inference state dictionary
         inference_state = {}
-        inference_state["images"] = images
-        inference_state["num_frames"] = len(images)
-        # whether to offload the video frames to CPU memory
-        # turning on this option saves the GPU memory with only a very small overhead
+        
+        # === Video Data and Metadata ===
+        inference_state["images"] = images  # Preprocessed video frames
+        inference_state["num_frames"] = len(images)  # Total frame count
+        inference_state["video_height"] = video_height  # Original video dimensions
+        inference_state["video_width"] = video_width   # Used for output resizing
+        inference_state["device"] = compute_device  # Model computation device
+        
+        # === Memory Management Configuration ===
+        # Video frame storage: GPU for speed vs CPU for memory efficiency
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
-        # whether to offload the inference state to CPU memory
-        # turning on this option saves the GPU memory at the cost of a lower tracking fps
-        # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
-        # and from 24 to 21 when tracking two objects)
+        
+        # Inference state storage: affects tracking performance vs memory usage
         inference_state["offload_state_to_cpu"] = offload_state_to_cpu
-        # the original video height and width, used for resizing final output scores
-        inference_state["video_height"] = video_height
-        inference_state["video_width"] = video_width
-        inference_state["device"] = compute_device
+        
+        # Determine storage device for intermediate computations and cached data
         if offload_state_to_cpu:
             inference_state["storage_device"] = torch.device("cpu")
         else:
             inference_state["storage_device"] = compute_device
-        # inputs on each frame
-        inference_state["point_inputs_per_obj"] = {}
-        inference_state["mask_inputs_per_obj"] = {}
-        # visual features on a small number of recently visited frames for quick interactions
+            
+        # === User Input Management (Per Object, Per Frame) ===
+        # Store user-provided point annotations for each object on each frame
+        inference_state["point_inputs_per_obj"] = {}  # {obj_idx: {frame_idx: points}}
+        
+        # Store user-provided mask annotations for each object on each frame  
+        inference_state["mask_inputs_per_obj"] = {}   # {obj_idx: {frame_idx: masks}}
+        
+        # === Performance Optimization Caches ===
+        # Cache computed visual features for recently accessed frames
+        # Enables fast re-computation when users interact with the same frames
         inference_state["cached_features"] = {}
-        # values that don't change across frames (so we only need to hold one copy of them)
+        
+        # Store values that remain constant across frames (e.g., positional encodings)
+        # Avoids redundant computation during video processing
         inference_state["constants"] = {}
-        # mapping between client-side object id and model-side object index
-        inference_state["obj_id_to_idx"] = OrderedDict()
-        inference_state["obj_idx_to_id"] = OrderedDict()
-        inference_state["obj_ids"] = []
-        # A storage to hold the model's tracking results and states on each frame
+        
+        # === Multi-Object Management System ===
+        # Bidirectional mapping between user-provided object IDs and internal indices
+        inference_state["obj_id_to_idx"] = OrderedDict()  # User ID → Model index
+        inference_state["obj_idx_to_id"] = OrderedDict()  # Model index → User ID
+        inference_state["obj_ids"] = []  # List of all registered object IDs
+        
+        # === Tracking Results Storage ===
+        # Main storage for model outputs organized by frame type
         inference_state["output_dict"] = {
-            "cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
-            "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
+            "cond_frame_outputs": {},     # Results for user-annotated frames
+            "non_cond_frame_outputs": {}, # Results for automatically tracked frames
         }
-        # Slice (view) of each object tracking results, sharing the same memory with "output_dict"
+        
+        # Per-object views into the main output dictionary (shares memory)
+        # Provides object-specific access while maintaining unified storage
         inference_state["output_dict_per_obj"] = {}
-        # A temporary storage to hold new outputs when user interact with a frame
-        # to add clicks or mask (it's merged into "output_dict" before propagation starts)
+        
+        # Temporary storage for new outputs during user interaction
+        # Merged into main output_dict before propagation begins
         inference_state["temp_output_dict_per_obj"] = {}
-        # Frames that already holds consolidated outputs from click or mask inputs
-        # (we directly use their consolidated outputs during tracking)
+        
+        # === Frame Processing State Management ===
+        # Track which frames have consolidated outputs from user inputs
+        # Prevents redundant processing during propagation
         inference_state["consolidated_frame_inds"] = {
-            "cond_frame_outputs": set(),  # set containing frame indices
-            "non_cond_frame_outputs": set(),  # set containing frame indices
+            "cond_frame_outputs": set(),     # Frame indices with conditioning outputs
+            "non_cond_frame_outputs": set(), # Frame indices with non-conditioning outputs
         }
-        # metadata for each tracking frame (e.g. which direction it's tracked)
+        
+        # === Tracking Session Control ===
+        # Flag indicating whether automatic propagation has started
+        # Controls when new objects can be added (only before tracking starts)
         inference_state["tracking_has_started"] = False
+        
+        # Metadata for each processed frame (tracking direction, completion status)
+        # Enables bidirectional propagation and incremental processing
         inference_state["frames_already_tracked"] = {}
-        # Warm up the visual backbone and cache the image feature on frame 0
+        
+        # === Model Warmup and Initial Feature Computation ===
+        # Pre-compute features for the first frame to warm up the model
+        # This reduces latency for the first user interaction
         self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
+        
         return inference_state
 
     @classmethod
