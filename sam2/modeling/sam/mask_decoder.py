@@ -223,6 +223,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        debug_name: str = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate segmentation masks from image and prompt embeddings.
@@ -246,6 +247,7 @@ class MaskDecoder(nn.Module):
                 batch size. Used when processing multiple prompts per image.
             high_res_features (Optional[List[torch.Tensor]]): Multi-scale features
                 from image encoder for enhanced resolution (if enabled).
+            debug_name (str, optional): Name for debug state capture.
 
         Returns:
             Tuple containing:
@@ -262,6 +264,43 @@ class MaskDecoder(nn.Module):
         5. Predict mask quality and object scores
         6. Select appropriate masks based on output mode
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
+        # Debug capture for input embeddings
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="input_image_embeddings",
+                data=image_embeddings,
+                metadata={'component_type': 'mask_decoder', 'stage': 'input', 'tensor_type': 'image_embeddings'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="input_image_pe",
+                data=image_pe,
+                metadata={'component_type': 'mask_decoder', 'stage': 'input', 'tensor_type': 'image_pe'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="input_sparse_prompt_embeddings",
+                data=sparse_prompt_embeddings,
+                metadata={'component_type': 'mask_decoder', 'stage': 'input', 'tensor_type': 'sparse_prompt_embeddings'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="input_dense_prompt_embeddings",
+                data=dense_prompt_embeddings,
+                metadata={'component_type': 'mask_decoder', 'stage': 'input', 'tensor_type': 'dense_prompt_embeddings'}
+            )
+            if high_res_features:
+                for i, feat in enumerate(high_res_features):
+                    capture_debug_state(
+                        component_name=debug_name or "mask_decoder",
+                        state_name=f"input_high_res_features_{i}",
+                        data=feat,
+                        metadata={'component_type': 'mask_decoder', 'stage': 'input', 'tensor_type': f'high_res_features_{i}'}
+                    )
+        
         # Generate masks and predictions using the core prediction pipeline
         masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
             image_embeddings=image_embeddings,
@@ -270,7 +309,35 @@ class MaskDecoder(nn.Module):
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
             high_res_features=high_res_features,
+            debug_name=f"{debug_name or 'mask_decoder'}_predict_masks" if debug_name else None,
         )
+
+        # Debug capture for raw prediction outputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="raw_masks_output",
+                data=masks,
+                metadata={'component_type': 'mask_decoder', 'stage': 'raw_output', 'tensor_type': 'masks'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="raw_iou_predictions",
+                data=iou_pred,
+                metadata={'component_type': 'mask_decoder', 'stage': 'raw_output', 'tensor_type': 'iou_predictions'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="raw_mask_tokens_output",
+                data=mask_tokens_out,
+                metadata={'component_type': 'mask_decoder', 'stage': 'raw_output', 'tensor_type': 'mask_tokens'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="raw_object_score_logits",
+                data=object_score_logits,
+                metadata={'component_type': 'mask_decoder', 'stage': 'raw_output', 'tensor_type': 'object_scores'}
+            )
 
         # Select appropriate masks based on output mode and dynamic selection
         if multimask_output:
@@ -295,6 +362,27 @@ class MaskDecoder(nn.Module):
             # are used as object memory representations
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [B, 1, C] shape
 
+        # Debug capture for final outputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="final_masks_output",
+                data=masks,
+                metadata={'component_type': 'mask_decoder', 'stage': 'final_output', 'tensor_type': 'masks', 'multimask_output': multimask_output}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="final_iou_predictions",
+                data=iou_pred,
+                metadata={'component_type': 'mask_decoder', 'stage': 'final_output', 'tensor_type': 'iou_predictions'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder",
+                state_name="final_sam_tokens_output",
+                data=sam_tokens_out,
+                metadata={'component_type': 'mask_decoder', 'stage': 'final_output', 'tensor_type': 'sam_tokens'}
+            )
+
         return masks, iou_pred, sam_tokens_out, object_score_logits
 
     def predict_masks(
@@ -305,6 +393,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
+        debug_name: str = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Core mask prediction pipeline using hypernetwork architecture.
@@ -335,6 +424,8 @@ class MaskDecoder(nn.Module):
         4. Networks are applied to upsampled image features
         5. Multiple masks enable ambiguity handling and quality comparison
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
         # Prepare learnable output tokens for transformer processing
         s = 0  # Offset for indexing tokens
         
@@ -355,12 +446,49 @@ class MaskDecoder(nn.Module):
                 [self.iou_token.weight, self.mask_tokens.weight], dim=0
             )
             
+        # Debug capture for output tokens
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="output_tokens",
+                data=output_tokens,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'tokens', 'tensor_type': 'output_tokens', 'pred_obj_scores': self.pred_obj_scores}
+            )
+            if self.pred_obj_scores:
+                capture_debug_state(
+                    component_name=debug_name or "mask_decoder_predict",
+                    state_name="obj_score_token",
+                    data=self.obj_score_token.weight,
+                    metadata={'component_type': 'mask_decoder_predict', 'stage': 'tokens', 'tensor_type': 'obj_score_token'}
+                )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="iou_token",
+                data=self.iou_token.weight,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'tokens', 'tensor_type': 'iou_token'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="mask_tokens",
+                data=self.mask_tokens.weight,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'tokens', 'tensor_type': 'mask_tokens'}
+            )
+            
         # Expand tokens to match batch size and combine with prompt embeddings
         output_tokens = output_tokens.unsqueeze(0).expand(
             sparse_prompt_embeddings.size(0), -1, -1
         )
         # Concatenate output tokens with prompt embeddings for joint processing
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
+
+        # Debug capture for combined tokens
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="combined_tokens",
+                data=tokens,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'tokens', 'tensor_type': 'combined_tokens'}
+            )
 
         # Prepare image embeddings for transformer processing
         if repeat_image:
@@ -375,6 +503,15 @@ class MaskDecoder(nn.Module):
         # Integrate dense prompt embeddings (masks) with image features
         src = src + dense_prompt_embeddings
         
+        # Debug capture for prepared source features
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="prepared_src_features",
+                data=src,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'preparation', 'tensor_type': 'src_features', 'repeat_image': repeat_image}
+            )
+        
         # Ensure positional encoding has correct batch dimension
         assert (
             image_pe.size(0) == 1
@@ -384,17 +521,56 @@ class MaskDecoder(nn.Module):
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
+        # Debug capture for positional encoding
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="positional_encoding_repeated",
+                data=pos_src,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'preparation', 'tensor_type': 'pos_src'}
+            )
+
         # Process tokens and image features through two-way transformer
         # This enables bidirectional attention between tokens and image features
-        hs, src = self.transformer(src, pos_src, tokens)
+        hs, src = self.transformer(src, pos_src, tokens, debug_name=f"{debug_name or 'mask_decoder_predict'}_transformer" if debug_name else None)
         
         # Extract processed tokens after transformer processing
         iou_token_out = hs[:, s, :]  # IoU prediction token
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]  # Mask tokens
 
+        # Debug capture for processed tokens
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="transformer_output_all_tokens",
+                data=hs,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'transformer_output', 'tensor_type': 'all_tokens'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="iou_token_processed",
+                data=iou_token_out,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'transformer_output', 'tensor_type': 'iou_token'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="mask_tokens_processed",
+                data=mask_tokens_out,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'transformer_output', 'tensor_type': 'mask_tokens'}
+            )
+
         # Prepare image features for mask generation
         # Reshape from transformer format back to spatial format
         src = src.transpose(1, 2).view(b, c, h, w)
+        
+        # Debug capture for reshaped source
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="src_reshaped_spatial",
+                data=src,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'reshape', 'tensor_type': 'src_spatial'}
+            )
         
         # Apply progressive upsampling to restore mask resolution
         if not self.use_high_res_features:
@@ -405,20 +581,73 @@ class MaskDecoder(nn.Module):
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
             feat_s0, feat_s1 = high_res_features
             
+            # Debug capture for high-res features
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "mask_decoder_predict",
+                    state_name="high_res_feat_s0",
+                    data=feat_s0,
+                    metadata={'component_type': 'mask_decoder_predict', 'stage': 'upsampling', 'tensor_type': 'high_res_feat_s0'}
+                )
+                capture_debug_state(
+                    component_name=debug_name or "mask_decoder_predict",
+                    state_name="high_res_feat_s1",
+                    data=feat_s1,
+                    metadata={'component_type': 'mask_decoder_predict', 'stage': 'upsampling', 'tensor_type': 'high_res_feat_s1'}
+                )
+            
             # First upsampling stage with high-res feature integration
-            upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
+            stage1_output = dc1(src) + feat_s1
+            upscaled_embedding = act1(ln1(stage1_output))
+            
+            # Debug capture for first upsampling stage
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "mask_decoder_predict",
+                    state_name="upsampling_stage1_output",
+                    data=upscaled_embedding,
+                    metadata={'component_type': 'mask_decoder_predict', 'stage': 'upsampling', 'tensor_type': 'stage1_output'}
+                )
+            
             # Second upsampling stage with finest feature integration  
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
+
+        # Debug capture for final upscaled embedding
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="upscaled_embedding_final",
+                data=upscaled_embedding,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'upsampling', 'tensor_type': 'upscaled_embedding', 'use_high_res': self.use_high_res_features}
+            )
 
         # Hypernetwork: Generate mask prediction networks from mask tokens
         # Each mask token produces parameters for its own prediction network
         hyper_in_list: List[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
             # Each MLP generates network parameters for mask prediction
-            hyper_in_list.append(
-                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-            )
+            hyper_out = self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
+            hyper_in_list.append(hyper_out)
+            
+            # Debug capture for individual hypernetwork outputs
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "mask_decoder_predict",
+                    state_name=f"hypernetwork_output_{i}",
+                    data=hyper_out,
+                    metadata={'component_type': 'mask_decoder_predict', 'stage': 'hypernetwork', 'tensor_type': f'hyper_out_{i}', 'mask_token_idx': i}
+                )
+                
         hyper_in = torch.stack(hyper_in_list, dim=1)  # [B, N_masks, C_hyper]
+        
+        # Debug capture for stacked hypernetwork outputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="hypernetwork_parameters_stacked",
+                data=hyper_in,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'hypernetwork', 'tensor_type': 'hyper_in_stacked'}
+            )
         
         # Apply hypernetwork-generated parameters to upscaled features
         # This performs dynamic convolution based on the mask token context
@@ -426,8 +655,26 @@ class MaskDecoder(nn.Module):
         # Matrix multiplication: [B, N_masks, C_hyper] @ [B, C_hyper, H*W] -> [B, N_masks, H*W]
         masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
 
+        # Debug capture for mask generation
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="masks_raw_logits",
+                data=masks,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'mask_generation', 'tensor_type': 'mask_logits'}
+            )
+
         # Generate mask quality predictions from IoU token
         iou_pred = self.iou_prediction_head(iou_token_out)
+        
+        # Debug capture for IoU predictions
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="iou_predictions",
+                data=iou_pred,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'prediction', 'tensor_type': 'iou_predictions'}
+            )
         
         # Generate object score predictions (if enabled)
         if self.pred_obj_scores:
@@ -437,6 +684,15 @@ class MaskDecoder(nn.Module):
             # Default object scores: high confidence (assuming object is present)
             # sigmoid(10.0) ≈ 1.0, indicating strong object presence
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
+
+        # Debug capture for object score predictions
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "mask_decoder_predict",
+                state_name="object_score_logits",
+                data=object_score_logits,
+                metadata={'component_type': 'mask_decoder_predict', 'stage': 'prediction', 'tensor_type': 'object_scores', 'pred_obj_scores': self.pred_obj_scores}
+            )
 
         return masks, iou_pred, mask_tokens_out, object_score_logits
 

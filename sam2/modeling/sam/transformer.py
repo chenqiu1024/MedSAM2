@@ -179,6 +179,7 @@ class TwoWayTransformer(nn.Module):
         image_embedding: Tensor,
         image_pe: Tensor,
         point_embedding: Tensor,
+        debug_name: str = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Process image and prompt embeddings through two-way transformer blocks.
@@ -196,6 +197,7 @@ class TwoWayTransformer(nn.Module):
             point_embedding (torch.Tensor): Sparse prompt embeddings (points, boxes,
                 mask tokens) with shape [B, N_prompts, embedding_dim]. These encode
                 user intentions and guidance for segmentation.
+            debug_name (str, optional): Name for debug state capture.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -214,11 +216,49 @@ class TwoWayTransformer(nn.Module):
         while image features are modulated by user intent, resulting in highly
         accurate and contextually appropriate segmentation masks.
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
+        # Debug capture for input embeddings
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="input_image_embedding",
+                data=image_embedding,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'input', 'tensor_type': 'image_embedding'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="input_image_pe",
+                data=image_pe,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'input', 'tensor_type': 'image_pe'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="input_point_embedding",
+                data=point_embedding,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'input', 'tensor_type': 'point_embedding'}
+            )
+        
         # Convert image embeddings from spatial to sequence format
         # Transform from [B, C, H, W] to [B, H*W, C] for transformer processing
         bs, c, h, w = image_embedding.shape
         image_embedding = image_embedding.flatten(2).permute(0, 2, 1)
         image_pe = image_pe.flatten(2).permute(0, 2, 1)
+
+        # Debug capture for reshaped embeddings
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="reshaped_image_embedding",
+                data=image_embedding,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'reshape', 'tensor_type': 'image_embedding'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="reshaped_image_pe",
+                data=image_pe,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'reshape', 'tensor_type': 'image_pe'}
+            )
 
         # Initialize queries and keys for attention operations
         # Queries: prompt embeddings that will attend to image features
@@ -228,23 +268,70 @@ class TwoWayTransformer(nn.Module):
 
         # Apply transformer blocks with bidirectional attention
         # Each block refines both prompt and image representations
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
             queries, keys = layer(
                 queries=queries,
                 keys=keys,
                 query_pe=point_embedding,  # Original prompt positions (unchanged)
                 key_pe=image_pe,          # Image spatial positions
+                debug_name=f"{debug_name or 'two_way_transformer'}_layer_{i}" if debug_name else None,
             )
+            
+            # Debug capture for layer outputs
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "two_way_transformer",
+                    state_name=f"layer_{i}_queries_output",
+                    data=queries,
+                    metadata={'component_type': 'two_way_transformer', 'stage': f'layer_{i}_output', 'tensor_type': 'queries'}
+                )
+                capture_debug_state(
+                    component_name=debug_name or "two_way_transformer",
+                    state_name=f"layer_{i}_keys_output",
+                    data=keys,
+                    metadata={'component_type': 'two_way_transformer', 'stage': f'layer_{i}_output', 'tensor_type': 'keys'}
+                )
 
         # Final attention layer: comprehensive prompt-to-image alignment
         # This ensures prompt tokens have fully integrated visual context
         q = queries + point_embedding  # Add positional info to refined queries
         k = keys + image_pe           # Add positional info to refined keys
-        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
+        
+        # Debug capture for final attention inputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="final_attention_queries",
+                data=q,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'final_attention_input', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="final_attention_keys",
+                data=k,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'final_attention_input', 'tensor_type': 'keys'}
+            )
+        
+        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys, debug_name=f"{debug_name or 'two_way_transformer'}_final_attn" if debug_name else None)
         
         # Apply residual connection and normalization
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
+
+        # Debug capture for final outputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="final_queries_output",
+                data=queries,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'final_output', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_transformer",
+                state_name="final_keys_output",
+                data=keys,
+                metadata={'component_type': 'two_way_transformer', 'stage': 'final_output', 'tensor_type': 'keys'}
+            )
 
         return queries, keys
 
@@ -330,7 +417,7 @@ class TwoWayAttentionBlock(nn.Module):
         self.skip_first_layer_pe = skip_first_layer_pe
 
     def forward(
-        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
+        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor, debug_name: str = None
     ) -> Tuple[Tensor, Tensor]:
         """
         Apply four-stage bidirectional attention between prompts and image features.
@@ -343,6 +430,7 @@ class TwoWayAttentionBlock(nn.Module):
             keys (Tensor): Image token embeddings [B, N_image, C] 
             query_pe (Tensor): Positional encoding for prompts [B, N_prompts, C]
             key_pe (Tensor): Positional encoding for image [B, N_image, C]
+            debug_name (str, optional): Name for debug state capture.
             
         Returns:
             Tuple[Tensor, Tensor]: Updated (queries, keys) after bidirectional attention
@@ -353,26 +441,72 @@ class TwoWayAttentionBlock(nn.Module):
         3. MLP: Non-linear transformation of prompt features
         4. Reverse cross-attention: Image features incorporate prompt context
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
+        # Debug capture for input tensors
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="input_queries",
+                data=queries,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'input', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="input_keys",
+                data=keys,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'input', 'tensor_type': 'keys'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="input_query_pe",
+                data=query_pe,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'input', 'tensor_type': 'query_pe'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="input_key_pe",
+                data=key_pe,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'input', 'tensor_type': 'key_pe'}
+            )
         
         # Stage 1: Self-attention among prompt tokens
         # This allows different prompts to coordinate and share information
         # Skip PE in first layer to avoid double-adding positional information
         if self.skip_first_layer_pe:
-            queries = self.self_attn(q=queries, k=queries, v=queries)
+            queries = self.self_attn(q=queries, k=queries, v=queries, debug_name=f"{debug_name or 'two_way_attention_block'}_self_attn" if debug_name else None)
         else:
             # Add positional encoding to queries for spatial awareness
             q = queries + query_pe
-            attn_out = self.self_attn(q=q, k=q, v=queries)
+            attn_out = self.self_attn(q=q, k=q, v=queries, debug_name=f"{debug_name or 'two_way_attention_block'}_self_attn" if debug_name else None)
             queries = queries + attn_out  # Residual connection
         queries = self.norm1(queries)
+
+        # Debug capture after stage 1
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="stage1_queries_output",
+                data=queries,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'stage1_output', 'tensor_type': 'queries'}
+            )
 
         # Stage 2: Cross-attention from prompts to image features
         # Prompts attend to image to gather relevant visual information
         q = queries + query_pe  # Prompt positions
         k = keys + key_pe      # Image positions
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
+        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys, debug_name=f"{debug_name or 'two_way_attention_block'}_cross_attn_token_to_image" if debug_name else None)
         queries = queries + attn_out  # Residual connection
         queries = self.norm2(queries)
+
+        # Debug capture after stage 2
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="stage2_queries_output",
+                data=queries,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'stage2_output', 'tensor_type': 'queries'}
+            )
 
         # Stage 3: MLP processing of prompt features
         # Non-linear transformation to increase representational capacity
@@ -380,14 +514,44 @@ class TwoWayAttentionBlock(nn.Module):
         queries = queries + mlp_out  # Residual connection
         queries = self.norm3(queries)
 
+        # Debug capture after stage 3
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="stage3_queries_output",
+                data=queries,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'stage3_output', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="stage3_mlp_output",
+                data=mlp_out,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'stage3_mlp', 'tensor_type': 'mlp_output'}
+            )
+
         # Stage 4: Cross-attention from image features to prompt tokens
         # Image features attend to prompts to incorporate user intent
         # Note: q and k are swapped to reverse the attention direction
         q = queries + query_pe  # Updated prompt positions
         k = keys + key_pe      # Image positions
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
+        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries, debug_name=f"{debug_name or 'two_way_attention_block'}_cross_attn_image_to_token" if debug_name else None)
         keys = keys + attn_out  # Update image features with prompt context
         keys = self.norm4(keys)
+
+        # Debug capture for final outputs
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="final_queries_output",
+                data=queries,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'final_output', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "two_way_attention_block",
+                state_name="final_keys_output",
+                data=keys,
+                metadata={'component_type': 'two_way_attention_block', 'stage': 'final_output', 'tensor_type': 'keys'}
+            )
 
         return queries, keys
 
@@ -492,7 +656,7 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, debug_name: str = None) -> Tensor:
         """
         Compute multi-head attention with optional hardware optimization.
         
@@ -500,6 +664,7 @@ class Attention(nn.Module):
             q: Query tensor [B, N_q, C]
             k: Key tensor [B, N_k, C_kv]  
             v: Value tensor [B, N_v, C_kv]
+            debug_name: Optional name for debug state capture
             
         Returns:
             Attention output [B, N_q, C]
@@ -511,18 +676,104 @@ class Attention(nn.Module):
         - Provides graceful fallback for compatibility
         - Applies dropout during training only
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
+        # Debug capture for input tensors
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="input_queries",
+                data=q,
+                metadata={'component_type': 'attention', 'stage': 'input', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="input_keys",
+                data=k,
+                metadata={'component_type': 'attention', 'stage': 'input', 'tensor_type': 'keys'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="input_values",
+                data=v,
+                metadata={'component_type': 'attention', 'stage': 'input', 'tensor_type': 'values'}
+            )
+        
         # Project inputs to internal dimension
         q = self.q_proj(q)
         k = self.k_proj(k)
         v = self.v_proj(v)
+
+        # Debug capture for projected tensors
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="projected_queries",
+                data=q,
+                metadata={'component_type': 'attention', 'stage': 'projection', 'tensor_type': 'queries'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="projected_keys",
+                data=k,
+                metadata={'component_type': 'attention', 'stage': 'projection', 'tensor_type': 'keys'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="projected_values",
+                data=v,
+                metadata={'component_type': 'attention', 'stage': 'projection', 'tensor_type': 'values'}
+            )
 
         # Separate into multiple attention heads for parallel processing
         q = self._separate_heads(q, self.num_heads)
         k = self._separate_heads(k, self.num_heads)
         v = self._separate_heads(v, self.num_heads)
 
+        # Debug capture for multi-head tensors
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="multihead_queries",
+                data=q,
+                metadata={'component_type': 'attention', 'stage': 'multihead', 'tensor_type': 'queries', 'num_heads': self.num_heads}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="multihead_keys",
+                data=k,
+                metadata={'component_type': 'attention', 'stage': 'multihead', 'tensor_type': 'keys', 'num_heads': self.num_heads}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="multihead_values",
+                data=v,
+                metadata={'component_type': 'attention', 'stage': 'multihead', 'tensor_type': 'values', 'num_heads': self.num_heads}
+            )
+
         # Apply dropout only during training
         dropout_p = self.dropout_p if self.training else 0.0
+        
+        # Compute attention weights manually for debug capture if needed
+        if debug_name and is_debug_enabled():
+            # Compute attention scores manually for debugging
+            scale = (q.shape[-1]) ** -0.5
+            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(attn_scores, dim=-1)
+            
+            # Capture attention weights
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="attention_scores",
+                data=attn_scores,
+                metadata={'component_type': 'attention', 'stage': 'attention_computation', 'tensor_type': 'scores'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="attention_weights",
+                data=attn_weights,
+                metadata={'component_type': 'attention', 'stage': 'attention_computation', 'tensor_type': 'weights', 'num_heads': self.num_heads}
+            )
         
         # Compute attention with hardware optimization
         try:
@@ -542,9 +793,27 @@ class Attention(nn.Module):
             ALLOW_ALL_KERNELS = True
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
+        # Debug capture for attention output
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="attention_output_multihead",
+                data=out,
+                metadata={'component_type': 'attention', 'stage': 'attention_output', 'tensor_type': 'multihead_output'}
+            )
+
         # Recombine attention heads and project to output dimension
         out = self._recombine_heads(out)
         out = self.out_proj(out)
+
+        # Debug capture for final output
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "attention",
+                state_name="final_output",
+                data=out,
+                metadata={'component_type': 'attention', 'stage': 'final_output', 'tensor_type': 'output'}
+            )
 
         return out
 

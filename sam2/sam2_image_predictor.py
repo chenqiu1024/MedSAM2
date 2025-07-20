@@ -89,6 +89,7 @@ class SAM2ImagePredictor:
         mask_threshold=0.0,
         max_hole_area=0.0,
         max_sprinkle_area=0.0,
+        debug_mode=False,
         **kwargs,
     ) -> None:
         """
@@ -110,6 +111,9 @@ class SAM2ImagePredictor:
             max_sprinkle_area (int): Maximum area of isolated regions to remove.
                                    If > 0, small disconnected regions up to this area
                                    will be removed to reduce noise. Specified in pixels.
+            debug_mode (bool): Enable debug mode for internal state visualization.
+                             When True, enables capture of intermediate states and activations
+                             that can be visualized for debugging and analysis purposes.
             **kwargs: Additional arguments (currently unused, for future extensibility).
         """
         super().__init__()
@@ -132,6 +136,12 @@ class SAM2ImagePredictor:
 
         # Predictor configuration
         self.mask_threshold = mask_threshold
+        self.debug_mode = debug_mode
+        
+        # Initialize debug mode if enabled
+        if self.debug_mode:
+            from sam2.debug_utils import enable_debug_mode
+            enable_debug_mode()
 
         # Pre-compute spatial dimensions for backbone feature maps at different scales
         # SAM2 uses multi-scale features: the image backbone outputs features at multiple
@@ -460,7 +470,8 @@ class SAM2ImagePredictor:
         multimask_output: bool = True,
         return_logits: bool = False,
         normalize_coords=True,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return_debug_states: bool = False,
+    ) -> Union[Tuple[np.ndarray, np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray, dict]]:
         """
         Generate mask predictions for the currently set image using various prompts.
         
@@ -495,18 +506,29 @@ class SAM2ImagePredictor:
             normalize_coords (bool): Coordinate space interpretation.
                 True: Coordinates relative to original image dimensions (default).
                 False: Coordinates in model input space (advanced usage).
+            return_debug_states (bool): Whether to return captured debug states.
+                True: Return debug states dictionary for visualization/analysis.
+                False: Return only prediction results (default).
+                Only effective when predictor was initialized with debug_mode=True.
 
         Returns:
-            Tuple of three arrays:
-            - masks (np.ndarray): Output masks, shape (C, H, W) where C is number of masks.
-                Values are binary (0/1) if return_logits=False, continuous if True.
-                H, W match original image dimensions.
-            - iou_predictions (np.ndarray): Quality scores, shape (C,).
-                Values in [0, 1] indicating predicted IoU with ground truth.
-                Higher scores indicate better quality masks.
-            - low_res_masks (np.ndarray): Low-resolution logits, shape (C, 256, 256).
-                Can be used as mask_input for subsequent refinement iterations.
-                Provides efficient representation for iterative workflows.
+            If return_debug_states=False:
+                Tuple of three arrays:
+                - masks (np.ndarray): Output masks, shape (C, H, W) where C is number of masks.
+                    Values are binary (0/1) if return_logits=False, continuous if True.
+                    H, W match original image dimensions.
+                - iou_predictions (np.ndarray): Quality scores, shape (C,).
+                    Values in [0, 1] indicating predicted IoU with ground truth.
+                    Higher scores indicate better quality masks.
+                - low_res_masks (np.ndarray): Low-resolution logits, shape (C, 256, 256).
+                    Can be used as mask_input for subsequent refinement iterations.
+                    Provides efficient representation for iterative workflows.
+                    
+            If return_debug_states=True:
+                Tuple of four elements including all above plus:
+                - debug_states (dict): Captured internal states from model components
+                    including position encodings, attention weights, embeddings, etc.
+                    Can be visualized using sam2.debug_utils.visualize_debug_states()
                 
         Raises:
             RuntimeError: If image embeddings haven't been computed via set_image().
@@ -541,6 +563,11 @@ class SAM2ImagePredictor:
             point_coords, point_labels, box, mask_input, normalize_coords
         )
 
+        # Clear debug states before prediction if debug mode is enabled
+        if self.debug_mode and return_debug_states:
+            from sam2.debug_utils import clear_debug_states
+            clear_debug_states()
+
         # Generate predictions using the SAM2 model
         masks, iou_predictions, low_res_masks = self._predict(
             unnorm_coords,
@@ -549,13 +576,21 @@ class SAM2ImagePredictor:
             mask_input,
             multimask_output,
             return_logits=return_logits,
+            return_debug_states=return_debug_states,
         )
 
         # Convert output tensors to numpy arrays for user consumption
         masks_np = masks.squeeze(0).float().detach().cpu().numpy()
         iou_predictions_np = iou_predictions.squeeze(0).float().detach().cpu().numpy()
         low_res_masks_np = low_res_masks.squeeze(0).float().detach().cpu().numpy()
-        return masks_np, iou_predictions_np, low_res_masks_np
+        
+        # Return debug states if requested
+        if self.debug_mode and return_debug_states:
+            from sam2.debug_utils import get_debug_states
+            debug_states = get_debug_states()
+            return masks_np, iou_predictions_np, low_res_masks_np, debug_states
+        else:
+            return masks_np, iou_predictions_np, low_res_masks_np
 
     def _prep_prompts(
         self, point_coords, point_labels, box, mask_logits, normalize_coords, img_idx=-1
@@ -649,6 +684,7 @@ class SAM2ImagePredictor:
         multimask_output: bool = True,
         return_logits: bool = False,
         img_idx: int = -1,
+        return_debug_states: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Internal prediction method that interfaces with the SAM2 model.
@@ -716,11 +752,22 @@ class SAM2ImagePredictor:
         # Encode prompts into sparse and dense embeddings
         # The prompt encoder converts discrete prompts into continuous embeddings
         # that can be processed by the transformer decoder
-        sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
-            points=concat_points,  # Combined point and box prompts
-            boxes=None,           # Boxes are handled through points
-            masks=mask_input,     # Previous mask for iterative refinement
-        )
+        prompt_encoder_debug_name = "sam_prompt_encoder" if (self.debug_mode and return_debug_states) else None
+        
+        # Check if prompt encoder supports debug parameter
+        if hasattr(self.model.sam_prompt_encoder, 'forward') and 'debug_name' in self.model.sam_prompt_encoder.forward.__code__.co_varnames:
+            sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
+                points=concat_points,  # Combined point and box prompts
+                boxes=None,           # Boxes are handled through points
+                masks=mask_input,     # Previous mask for iterative refinement
+                debug_name=prompt_encoder_debug_name,
+            )
+        else:
+            sparse_embeddings, dense_embeddings = self.model.sam_prompt_encoder(
+                points=concat_points,  # Combined point and box prompts
+                boxes=None,           # Boxes are handled through points
+                masks=mask_input,     # Previous mask for iterative refinement
+            )
 
         # Determine if we're in multi-object prediction mode
         # This affects how the decoder processes multiple prompts
@@ -738,15 +785,30 @@ class SAM2ImagePredictor:
         # Generate masks using the SAM decoder
         # The decoder combines image embeddings, prompt embeddings, and high-res features
         # to produce accurate segmentation masks with quality predictions
-        low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
-            image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
-            image_pe=self.model.sam_prompt_encoder.get_dense_pe(),  # Positional encoding
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=batched_mode,  # Handle multiple objects on same image
-            high_res_features=high_res_features,
-        )
+        mask_decoder_debug_name = "sam_mask_decoder" if (self.debug_mode and return_debug_states) else None
+        
+        # Check if mask decoder supports debug parameter
+        if hasattr(self.model.sam_mask_decoder, 'forward') and 'debug_name' in self.model.sam_mask_decoder.forward.__code__.co_varnames:
+            low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
+                image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
+                image_pe=self.model.sam_prompt_encoder.get_dense_pe(),  # Positional encoding
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=batched_mode,  # Handle multiple objects on same image
+                high_res_features=high_res_features,
+                debug_name=mask_decoder_debug_name,
+            )
+        else:
+            low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
+                image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
+                image_pe=self.model.sam_prompt_encoder.get_dense_pe(),  # Positional encoding
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=batched_mode,  # Handle multiple objects on same image
+                high_res_features=high_res_features,
+            )
 
         # Upscale masks to original image resolution
         # The decoder outputs low-resolution masks that need upsampling

@@ -28,14 +28,79 @@ class ImageEncoder(nn.Module):
             self.trunk.channel_list == self.neck.backbone_channel_list
         ), f"Channel dims of trunk and neck do not match. Trunk: {self.trunk.channel_list}, neck: {self.neck.backbone_channel_list}"
 
-    def forward(self, sample: torch.Tensor):
+    def forward(self, sample: torch.Tensor, debug_name: str = None):
+        # Debug capture for input image
+        if debug_name:
+            from sam2.debug_utils import capture_debug_state, is_debug_enabled
+            if is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "image_encoder",
+                    state_name="input_image",
+                    data=sample,
+                    metadata={'component_type': 'image_encoder', 'stage': 'input'}
+                )
+
         # Forward through backbone
-        features, pos = self.neck(self.trunk(sample))
+        trunk_features = self.trunk(sample)
+        
+        # Debug capture for trunk features
+        if debug_name:
+            from sam2.debug_utils import capture_debug_state, is_debug_enabled
+            if is_debug_enabled():
+                if isinstance(trunk_features, (list, tuple)):
+                    for i, feat in enumerate(trunk_features):
+                        capture_debug_state(
+                            component_name=debug_name or "image_encoder",
+                            state_name=f"trunk_features_level_{i}",
+                            data=feat,
+                            metadata={'component_type': 'image_encoder', 'stage': 'trunk_output', 'level': i}
+                        )
+                else:
+                    capture_debug_state(
+                        component_name=debug_name or "image_encoder",
+                        state_name="trunk_features",
+                        data=trunk_features,
+                        metadata={'component_type': 'image_encoder', 'stage': 'trunk_output'}
+                    )
+        
+        features, pos = self.neck(trunk_features, debug_name=debug_name)
+        
         if self.scalp > 0:
             # Discard the lowest resolution features
             features, pos = features[: -self.scalp], pos[: -self.scalp]
 
         src = features[-1]
+        
+        # Debug capture for final output features
+        if debug_name:
+            from sam2.debug_utils import capture_debug_state, is_debug_enabled
+            if is_debug_enabled():
+                # Capture final vision features
+                capture_debug_state(
+                    component_name=debug_name or "image_encoder",
+                    state_name="vision_features_final",
+                    data=src,
+                    metadata={'component_type': 'image_encoder', 'stage': 'final_output'}
+                )
+                
+                # Capture FPN features at all levels
+                for i, feat in enumerate(features):
+                    capture_debug_state(
+                        component_name=debug_name or "image_encoder",
+                        state_name=f"fpn_features_level_{i}",
+                        data=feat,
+                        metadata={'component_type': 'image_encoder', 'stage': 'fpn_output', 'level': i}
+                    )
+                
+                # Capture position encodings
+                for i, p in enumerate(pos):
+                    capture_debug_state(
+                        component_name=debug_name or "image_encoder",
+                        state_name=f"position_encoding_level_{i}",
+                        data=p,
+                        metadata={'component_type': 'image_encoder', 'stage': 'position_encoding', 'level': i}
+                    )
+
         output = {
             "vision_features": src,
             "vision_pos_enc": pos,
@@ -101,11 +166,23 @@ class FpnNeck(nn.Module):
             fpn_top_down_levels = range(len(self.convs))
         self.fpn_top_down_levels = list(fpn_top_down_levels)
 
-    def forward(self, xs: List[torch.Tensor]):
+    def forward(self, xs: List[torch.Tensor], debug_name: str = None):
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
 
         out = [None] * len(self.convs)
         pos = [None] * len(self.convs)
         assert len(xs) == len(self.convs)
+        
+        # Debug capture for input features
+        if debug_name and is_debug_enabled():
+            for i, x in enumerate(xs):
+                capture_debug_state(
+                    component_name=debug_name or "fpn_neck",
+                    state_name=f"input_features_level_{i}",
+                    data=x,
+                    metadata={'component_type': 'fpn_neck', 'stage': 'input', 'level': i}
+                )
+        
         # fpn forward pass
         # see https://github.com/facebookresearch/detectron2/blob/main/detectron2/modeling/backbone/fpn.py
         prev_features = None
@@ -114,6 +191,16 @@ class FpnNeck(nn.Module):
         for i in range(n, -1, -1):
             x = xs[i]
             lateral_features = self.convs[n - i](x)
+            
+            # Debug capture for lateral features
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "fpn_neck",
+                    state_name=f"lateral_features_level_{i}",
+                    data=lateral_features,
+                    metadata={'component_type': 'fpn_neck', 'stage': 'lateral', 'level': i}
+                )
+            
             if i in self.fpn_top_down_levels and prev_features is not None:
                 top_down_features = F.interpolate(
                     prev_features.to(dtype=torch.float32),
@@ -124,14 +211,45 @@ class FpnNeck(nn.Module):
                     ),
                     antialias=False,
                 )
+                
+                # Debug capture for top-down features
+                if debug_name and is_debug_enabled():
+                    capture_debug_state(
+                        component_name=debug_name or "fpn_neck",
+                        state_name=f"top_down_features_level_{i}",
+                        data=top_down_features,
+                        metadata={'component_type': 'fpn_neck', 'stage': 'top_down', 'level': i}
+                    )
+                
                 prev_features = lateral_features + top_down_features
                 if self.fuse_type == "avg":
                     prev_features /= 2
             else:
                 prev_features = lateral_features
+            
             x_out = prev_features
             out[i] = x_out
-            pos[i] = self.position_encoding(x_out).to(x_out.dtype)
+            
+            # Generate position encoding with debug support
+            if hasattr(self.position_encoding, 'forward') and 'debug_name' in self.position_encoding.forward.__code__.co_varnames:
+                pos[i] = self.position_encoding(x_out, debug_name=f"{debug_name or 'fpn_neck'}_pos_enc_level_{i}").to(x_out.dtype)
+            else:
+                pos[i] = self.position_encoding(x_out).to(x_out.dtype)
+            
+            # Debug capture for output features and position encodings
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "fpn_neck",
+                    state_name=f"output_features_level_{i}",
+                    data=x_out,
+                    metadata={'component_type': 'fpn_neck', 'stage': 'output', 'level': i}
+                )
+                capture_debug_state(
+                    component_name=debug_name or "fpn_neck",
+                    state_name=f"position_encoding_level_{i}",
+                    data=pos[i],
+                    metadata={'component_type': 'fpn_neck', 'stage': 'position_encoding', 'level': i}
+                )
 
         return out, pos
 
@@ -187,15 +305,47 @@ class ViTDetNeck(nn.Module):
                 current.add_module("norm_1", LayerNorm2d(d_model))
             self.convs.append(current)
 
-    def forward(self, xs: List[torch.Tensor]):
+    def forward(self, xs: List[torch.Tensor], debug_name: str = None):
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
         out = [None] * len(self.convs)
         pos = [None] * len(self.convs)
         assert len(xs) == len(self.convs)
 
         x = xs[0]
+        
+        # Debug capture for input
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "vitdet_neck",
+                state_name="input_features",
+                data=x,
+                metadata={'component_type': 'vitdet_neck', 'stage': 'input'}
+            )
+        
         x_out = self.convs[0](x)
         out[0] = x_out
-        pos[0] = self.position_encoding(x_out).to(x_out.dtype)
+        
+        # Generate position encoding with debug support
+        if hasattr(self.position_encoding, 'forward') and 'debug_name' in self.position_encoding.forward.__code__.co_varnames:
+            pos[0] = self.position_encoding(x_out, debug_name=f"{debug_name or 'vitdet_neck'}_pos_enc").to(x_out.dtype)
+        else:
+            pos[0] = self.position_encoding(x_out).to(x_out.dtype)
+        
+        # Debug capture for output
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "vitdet_neck",
+                state_name="output_features",
+                data=x_out,
+                metadata={'component_type': 'vitdet_neck', 'stage': 'output'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "vitdet_neck",
+                state_name="position_encoding",
+                data=pos[0],
+                metadata={'component_type': 'vitdet_neck', 'stage': 'position_encoding'}
+            )
 
         return out, pos
 

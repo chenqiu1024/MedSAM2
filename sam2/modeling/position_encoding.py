@@ -282,7 +282,7 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, debug_name: str = None):
         """
         Generate 2D position embeddings for dense image feature maps.
         
@@ -297,6 +297,8 @@ class PositionEmbeddingSine(nn.Module):
         Args:
             x (torch.Tensor): Input feature tensor with shape (batch, channels, height, width)
                              The spatial dimensions (H, W) determine the position grid size.
+            debug_name (str, optional): Name for debug state capture. If provided and debug mode
+                                      is enabled, captures intermediate states for visualization.
                              
         Returns:
             torch.Tensor: Position embeddings with shape (batch, embedding_dim, height, width)
@@ -316,11 +318,30 @@ class PositionEmbeddingSine(nn.Module):
             # Use in attention
             pos_embed = position_encoder(features).flatten(2).transpose(1, 2)  # (B, H*W, embed_dim)
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
         # Use spatial dimensions as cache key for efficient reuse
         cache_key = (x.shape[-2], x.shape[-1])
         if cache_key in self.cache:
             # Reuse cached computation and repeat for batch dimension
-            return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
+            pos = self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)
+            
+            # Debug capture for cached result
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "position_encoding_sine",
+                    state_name="position_embeddings_cached",
+                    data=pos,
+                    metadata={
+                        'encoding_type': 'sine',
+                        'cached': True,
+                        'spatial_dims': cache_key,
+                        'normalize': self.normalize,
+                        'scale': self.scale,
+                        'temperature': self.temperature
+                    }
+                )
+            return pos
             
         # Create dense coordinate grids for the spatial dimensions
         # Y coordinates: increase downward (standard image convention)
@@ -336,15 +357,54 @@ class PositionEmbeddingSine(nn.Module):
             .repeat(x.shape[0], x.shape[-2], 1)
         )
 
+        # Debug capture for raw coordinate grids
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="coordinate_grids_x",
+                data=x_embed,
+                metadata={'encoding_type': 'sine', 'coordinate_type': 'x_raw'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="coordinate_grids_y",
+                data=y_embed,
+                metadata={'encoding_type': 'sine', 'coordinate_type': 'y_raw'}
+            )
+
         # Normalize coordinates to [0, 1] range for scale invariance
         if self.normalize:
             eps = 1e-6  # Small epsilon to prevent division by zero
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale
             x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale
 
+            # Debug capture for normalized coordinates
+            if debug_name and is_debug_enabled():
+                capture_debug_state(
+                    component_name=debug_name or "position_encoding_sine",
+                    state_name="coordinate_grids_x_normalized",
+                    data=x_embed,
+                    metadata={'encoding_type': 'sine', 'coordinate_type': 'x_normalized', 'scale': self.scale}
+                )
+                capture_debug_state(
+                    component_name=debug_name or "position_encoding_sine",
+                    state_name="coordinate_grids_y_normalized",
+                    data=y_embed,
+                    metadata={'encoding_type': 'sine', 'coordinate_type': 'y_normalized', 'scale': self.scale}
+                )
+
         # Generate frequency dimensions for sinusoidal encoding
         dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)
+
+        # Debug capture for frequency dimensions
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="frequency_dimensions",
+                data=dim_t,
+                metadata={'encoding_type': 'sine', 'temperature': self.temperature, 'num_pos_feats': self.num_pos_feats}
+            )
 
         # Apply sinusoidal encoding to every spatial position
         pos_x = x_embed[:, :, :, None] / dim_t
@@ -358,8 +418,40 @@ class PositionEmbeddingSine(nn.Module):
             (pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4
         ).flatten(3)
         
+        # Debug capture for intermediate sin/cos encodings
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="sinusoidal_encoding_x",
+                data=pos_x,
+                metadata={'encoding_type': 'sine', 'coordinate_type': 'x_encoded'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="sinusoidal_encoding_y",
+                data=pos_y,
+                metadata={'encoding_type': 'sine', 'coordinate_type': 'y_encoded'}
+            )
+        
         # Concatenate y and x embeddings, then permute to standard format
         pos = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
+        
+        # Debug capture for final position embeddings
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_sine",
+                state_name="position_embeddings_final",
+                data=pos,
+                metadata={
+                    'encoding_type': 'sine',
+                    'cached': False,
+                    'spatial_dims': cache_key,
+                    'normalize': self.normalize,
+                    'scale': self.scale,
+                    'temperature': self.temperature,
+                    'num_pos_feats': self.num_pos_feats
+                }
+            )
         
         # Cache result for future use with same spatial dimensions
         self.cache[cache_key] = pos[0]
@@ -431,7 +523,7 @@ class PositionEmbeddingRandom(nn.Module):
             scale * torch.randn((2, num_pos_feats)),
         )
 
-    def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
+    def _pe_encoding(self, coords: torch.Tensor, debug_name: str = None) -> torch.Tensor:
         """
         Apply random Fourier feature encoding to normalized coordinates.
         
@@ -443,6 +535,7 @@ class PositionEmbeddingRandom(nn.Module):
         Args:
             coords (torch.Tensor): Normalized coordinates in [0,1]² with shape (..., 2)
                                  Last dimension contains (x, y) coordinate pairs.
+            debug_name (str, optional): Name for debug state capture.
                                  
         Returns:
             torch.Tensor: Encoded features with shape (..., 2*num_pos_feats)
@@ -460,20 +553,84 @@ class PositionEmbeddingRandom(nn.Module):
         - Rich: Can represent complex spatial functions
         - Efficient: Single matrix multiplication + elementwise operations
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
+        # Debug capture for input coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="input_coordinates",
+                data=coords,
+                metadata={'encoding_type': 'random', 'coordinate_range': '[0,1]'}
+            )
+        
         # Normalize coordinates from [0,1] to [-1,1] for symmetric representation
         coords = 2 * coords - 1
         
+        # Debug capture for normalized coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="normalized_coordinates",
+                data=coords,
+                metadata={'encoding_type': 'random', 'coordinate_range': '[-1,1]'}
+            )
+        
         # Apply random linear projection to map 2D coords to higher-dimensional space
         coords = coords @ self.positional_encoding_gaussian_matrix
+        
+        # Debug capture for projected coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="projected_coordinates",
+                data=coords,
+                metadata={'encoding_type': 'random', 'projection_shape': str(self.positional_encoding_gaussian_matrix.shape)}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="gaussian_projection_matrix",
+                data=self.positional_encoding_gaussian_matrix,
+                metadata={'encoding_type': 'random', 'matrix_type': 'gaussian_random'}
+            )
         
         # Scale by 2π for full period coverage of sinusoidal functions
         coords = 2 * np.pi * coords
         
         # Apply sinusoidal activation and concatenate sin/cos components
+        sin_coords = torch.sin(coords)
+        cos_coords = torch.cos(coords)
+        
+        # Debug capture for sin/cos components
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="sin_components",
+                data=sin_coords,
+                metadata={'encoding_type': 'random', 'activation': 'sine'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="cos_components",
+                data=cos_coords,
+                metadata={'encoding_type': 'random', 'activation': 'cosine'}
+            )
+        
         # This creates a rich, smooth representation of spatial position
-        return torch.cat([torch.sin(coords), torch.cos(coords)], dim=-1)
+        result = torch.cat([sin_coords, cos_coords], dim=-1)
+        
+        # Debug capture for final encoding
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="final_encoding",
+                data=result,
+                metadata={'encoding_type': 'random', 'final_dim': result.shape[-1]}
+            )
+        
+        return result
 
-    def forward(self, size: Tuple[int, int]) -> torch.Tensor:
+    def forward(self, size: Tuple[int, int], debug_name: str = None) -> torch.Tensor:
         """
         Generate random Fourier position encoding for a 2D spatial grid.
         
@@ -483,6 +640,7 @@ class PositionEmbeddingRandom(nn.Module):
         
         Args:
             size (Tuple[int, int]): Spatial grid dimensions (height, width)
+            debug_name (str, optional): Name for debug state capture.
             
         Returns:
             torch.Tensor: Position encoding with shape (2*num_pos_feats, height, width)
@@ -497,6 +655,8 @@ class PositionEmbeddingRandom(nn.Module):
             pos_embed = encoder.forward((32, 32))  # Match feature map size
             features = features + pos_embed  # Element-wise addition
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
         h, w = size
         device: Any = self.positional_encoding_gaussian_matrix.device
         
@@ -507,18 +667,60 @@ class PositionEmbeddingRandom(nn.Module):
         y_embed = grid.cumsum(dim=0) - 0.5
         x_embed = grid.cumsum(dim=1) - 0.5
         
+        # Debug capture for raw coordinate grids
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="coordinate_grid_x_raw",
+                data=x_embed,
+                metadata={'encoding_type': 'random', 'grid_size': size, 'coordinate_type': 'x_raw'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="coordinate_grid_y_raw",
+                data=y_embed,
+                metadata={'encoding_type': 'random', 'grid_size': size, 'coordinate_type': 'y_raw'}
+            )
+        
         # Normalize coordinates to [0,1] range for scale invariance
         y_embed = y_embed / h
         x_embed = x_embed / w
 
+        # Debug capture for normalized coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="coordinate_grid_x_normalized",
+                data=x_embed,
+                metadata={'encoding_type': 'random', 'grid_size': size, 'coordinate_type': 'x_normalized'}
+            )
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="coordinate_grid_y_normalized",
+                data=y_embed,
+                metadata={'encoding_type': 'random', 'grid_size': size, 'coordinate_type': 'y_normalized'}
+            )
+
         # Apply random Fourier feature encoding to coordinate pairs
-        pe = self._pe_encoding(torch.stack([x_embed, y_embed], dim=-1))
+        coords_stack = torch.stack([x_embed, y_embed], dim=-1)
+        pe = self._pe_encoding(coords_stack, debug_name=debug_name)
         
         # Permute to channel-first format: (features, height, width)
-        return pe.permute(2, 0, 1)
+        result = pe.permute(2, 0, 1)
+        
+        # Debug capture for final result
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="position_embeddings_grid",
+                data=result,
+                metadata={'encoding_type': 'random', 'grid_size': size, 'output_shape': result.shape}
+            )
+        
+        return result
 
     def forward_with_coords(
-        self, coords_input: torch.Tensor, image_size: Tuple[int, int]
+        self, coords_input: torch.Tensor, image_size: Tuple[int, int], debug_name: str = None
     ) -> torch.Tensor:
         """
         Encode arbitrary 2D coordinates with random Fourier features.
@@ -534,6 +736,8 @@ class PositionEmbeddingRandom(nn.Module):
                                         
             image_size (Tuple[int, int]): Reference image dimensions (height, width)
                                         Used for coordinate normalization.
+            
+            debug_name (str, optional): Name for debug state capture.
                                         
         Returns:
             torch.Tensor: Position encodings with shape (batch, num_points, 2*num_pos_feats)
@@ -550,15 +754,46 @@ class PositionEmbeddingRandom(nn.Module):
             clicks = torch.tensor([[[100, 150], [200, 300]]])  # (1, 2, 2)
             embeddings = encoder.forward_with_coords(clicks, (512, 512))  # (1, 2, 128)
         """
+        from sam2.debug_utils import capture_debug_state, is_debug_enabled
+        
         # Clone input to avoid modifying original coordinates
         coords = coords_input.clone()
+        
+        # Debug capture for input coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="sparse_coordinates_input",
+                data=coords,
+                metadata={'encoding_type': 'random', 'coordinate_space': 'pixel', 'image_size': image_size}
+            )
         
         # Normalize coordinates to [0,1] range based on image dimensions
         coords[:, :, 0] = coords[:, :, 0] / image_size[1]  # x coordinate (width)
         coords[:, :, 1] = coords[:, :, 1] / image_size[0]  # y coordinate (height)
         
+        # Debug capture for normalized coordinates
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="sparse_coordinates_normalized",
+                data=coords,
+                metadata={'encoding_type': 'random', 'coordinate_space': 'normalized', 'image_size': image_size}
+            )
+        
         # Apply random Fourier feature encoding
-        return self._pe_encoding(coords.to(torch.float))
+        result = self._pe_encoding(coords.to(torch.float), debug_name=debug_name)
+        
+        # Debug capture for final result
+        if debug_name and is_debug_enabled():
+            capture_debug_state(
+                component_name=debug_name or "position_encoding_random",
+                state_name="sparse_coordinates_encoded",
+                data=result,
+                metadata={'encoding_type': 'random', 'output_shape': result.shape, 'num_points': coords.shape[1]}
+            )
+        
+        return result
 
 
 # ============================================================================
