@@ -147,6 +147,9 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = scale
 
         # Cache for storing computed position embeddings to avoid recomputation
+        # This optimization is crucial for video processing where multiple frames
+        # often have the same spatial dimensions, and for transformer models where
+        # the same position encodings are reused across attention layers
         # Key: (height, width) → Value: position embedding tensor
         self.cache = {}
 
@@ -856,42 +859,84 @@ def init_t_xy(end_x: int, end_y: int):
 
 def compute_axial_cis(dim: int, end_x: int, end_y: int, theta: float = 10000.0):
     """
-    Compute complex exponentials for axial (2D) rotary position encoding.
+    Compute complex exponentials for 2D Rotary Position Encoding (RoPE) in vision tasks.
     
-    This function generates the rotation matrices needed for RoPE in 2D spatial
-    domains. It creates separate rotation frequencies for x and y dimensions,
-    allowing the model to distinguish between horizontal and vertical relative
-    positions independently.
+    This function is a cornerstone of SAM2's spatial understanding, implementing 2D RoPE
+    for vision transformers. It extends the original RoPE concept from 1D sequences to
+    2D spatial grids, enabling transformers to understand spatial relationships in images.
     
-    Mathematical Foundation:
-    For each position (x, y) and frequency ω:
-    - x-rotation: e^(i * ω * x) = cos(ω*x) + i*sin(ω*x)
-    - y-rotation: e^(i * ω * y) = cos(ω*y) + i*sin(ω*y)
+    **Theoretical Foundation from RoFormer:**
+    RoPE encodes position information by rotating feature vectors in complex space:
+    - For 1D: f(x,m) = x * e^(i*m*θ) where m is position, θ is frequency
+    - For 2D: f(x,m,n) = x * e^(i*m*θ_x) * e^(i*n*θ_y) for position (m,n)
     
-    The frequencies follow a geometric progression:
-    ω_k = 1 / (theta^(k/dim)) where k is the frequency index
+    **Key Innovation for Vision Tasks:**
+    Unlike language models with 1D token sequences, vision requires 2D spatial awareness.
+    This function creates separate rotation frequencies for horizontal (x) and vertical (y)
+    dimensions, allowing the model to distinguish:
+    - Horizontal relationships: objects side-by-side
+    - Vertical relationships: objects above/below  
+    - Diagonal relationships: combination of x,y rotations
+    
+    **Mathematical Details:**
+    For each spatial position (x, y) and frequency index k:
+    
+    Frequency calculation (geometric decay):
+    ω_k = 1 / (theta^(2k/dim)) where k ∈ [0, dim/4)
+    
+    Complex rotation for position (x, y):
+    - X-component: e^(i * ω_k * x) = cos(ω_k*x) + i*sin(ω_k*x)  
+    - Y-component: e^(i * ω_k * y) = cos(ω_k*y) + i*sin(ω_k*y)
+    
+    **Benefits over Traditional Position Encoding:**
+    1. **Relative Awareness**: Attention naturally depends on relative positions
+    2. **Extrapolation**: Works on image sizes not seen during training
+    3. **Parameter Efficiency**: No learnable position parameters needed
+    4. **Rotation Equivariance**: Consistent under coordinate transformations
+    
+    **Applications in SAM2:**
+    - Image patch attention with spatial awareness
+    - Cross-attention between prompts and image regions
+    - Memory attention for temporal-spatial consistency
+    - Multi-scale feature fusion with position preservation
     
     Args:
-        dim (int): Feature dimension, must be divisible by 4 for x,y encoding.
-                  Each dimension gets dim//4 frequency components for x and y.
+        dim (int): Feature dimension per attention head, must be divisible by 4.
+                  Constraint needed because we encode 2D positions (x,y) using
+                  complex numbers, requiring dim/2 complex values = dim/4 per dimension.
+                  Typical values: 64, 128, 256 (matching transformer head dimensions).
                   
-        end_x (int): Width of spatial grid (maximum x coordinate + 1)
-        end_y (int): Height of spatial grid (maximum y coordinate + 1)
-        
-        theta (float): Base frequency for rotation computation. Higher values
-                      result in slower rotation → better for longer sequences.
-                      Default 10000 matches standard RoPE implementations.
+        end_x (int): Width of the spatial grid (number of columns).
+                    Corresponds to width of feature maps or image patches.
+                    For 512x512 image with 16x16 patches: end_x = 32.
+                    
+        end_y (int): Height of the spatial grid (number of rows).
+                    Corresponds to height of feature maps or image patches.
+                    Should match the spatial dimensions of input features.
+                    
+        theta (float): Base frequency parameter controlling rotation speed.
+                      Higher values → slower rotation → better for longer sequences.
+                      Lower values → faster rotation → finer position discrimination.
+                      Default 10000 follows RoFormer paper and works well for vision.
                       
     Returns:
-        torch.Tensor: Complex exponentials with shape (end_x * end_y, dim//2)
-                     Contains rotation matrices for each spatial position.
+        torch.Tensor: Complex exponentials with shape (end_x * end_y, dim//2).
+                     Each row contains rotation coefficients for one spatial position.
+                     First dim//4 elements: x-dimension rotations
+                     Last dim//4 elements: y-dimension rotations
+                     Ready for use in apply_rotary_enc() function.
                      
     Raises:
-        AssertionError: If dim is not divisible by 4 (needed for x,y split).
+        AssertionError: If dim is not divisible by 4. This constraint ensures
+                       equal allocation of features to x and y spatial dimensions.
+                       
+    Example:
+        # For 32x32 feature map with 128-dim features per head
+        freqs_cis = compute_axial_cis(dim=128, end_x=32, end_y=32)
+        # freqs_cis.shape = (1024, 64) for all spatial positions
         
-    Usage:
-        Used internally by apply_rotary_enc() to rotate query/key vectors
-        based on their spatial positions in attention computation.
+        # Use in attention layer
+        q_rot, k_rot = apply_rotary_enc(queries, keys, freqs_cis)
     """
     # Generate frequency scales with geometric progression
     # Lower indices → higher frequencies → finer spatial discrimination

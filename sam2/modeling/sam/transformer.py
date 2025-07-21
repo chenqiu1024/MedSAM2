@@ -151,8 +151,14 @@ class TwoWayTransformer(nn.Module):
         self.num_heads = num_heads
         self.mlp_dim = mlp_dim
         
-        # Create stack of two-way attention blocks
-        # Each block performs bidirectional attention between prompts and image
+        # Create stack of two-way attention blocks following transformer design principles
+        # Each block performs bidirectional attention between prompts and image features,
+        # enabling sophisticated interaction between user intent and visual content.
+        # 
+        # Architecture inspired by Vision Transformer (arXiv:2010.11929) self-attention
+        # but extended with cross-attention for prompt-image interaction. The depth
+        # parameter controls the number of refinement iterations, with more layers
+        # allowing more sophisticated prompt-image alignment at higher computational cost.
         self.layers = nn.ModuleList()
         for i in range(depth):
             self.layers.append(
@@ -163,12 +169,19 @@ class TwoWayTransformer(nn.Module):
                     activation=activation,
                     attention_downsample_rate=attention_downsample_rate,
                     # Skip positional encoding in first layer to avoid double-adding
+                    # since input embeddings may already contain positional information
                     skip_first_layer_pe=(i == 0),
                 )
             )
 
         # Final attention layer for comprehensive prompt-to-image alignment
-        # This layer ensures that prompt tokens have fully integrated image context
+        # This critical layer ensures that prompt tokens have fully integrated visual context
+        # before mask generation. Following the MAE asymmetric design principle (arXiv:2111.06377),
+        # this final attention focuses computational resources on the most important alignment
+        # between refined prompt representations and visual features.
+        # 
+        # The final attention serves as a "readout" mechanism where prompt tokens gather
+        # their final visual context, similar to how MAE's decoder attends to encoder features.
         self.final_attn_token_to_image = Attention(
             embedding_dim, num_heads, downsample_rate=attention_downsample_rate
         )
@@ -558,23 +571,45 @@ class TwoWayAttentionBlock(nn.Module):
 
 class Attention(nn.Module):
     """
-    Multi-head attention layer with optional downsampling for computational efficiency.
+    Multi-head attention layer with computational optimizations for vision applications.
     
-    This is a flexible attention implementation that supports:
-    - Standard multi-head attention computation
-    - Optional dimension downsampling to reduce memory usage
-    - Different input dimensions for keys/values vs queries
-    - Dropout regularization during training
-    - Hardware-optimized attention kernels (Flash Attention)
+    This implementation extends the standard attention mechanism from Vision Transformers
+    (arXiv:2010.11929) with several enhancements for efficient processing of high-resolution
+    image features and cross-modal prompt-image interactions.
     
-    The downsampling capability is particularly useful for processing high-resolution
-    image features, allowing the model to maintain reasonable computational costs
-    while preserving important attention patterns.
-    
-    Mathematical Operation:
+    Core Mathematical Operation (from "Attention Is All You Need"):
     Attention(Q, K, V) = softmax(QK^T / √d_k)V
     
-    Where Q, K, V are projected from input embeddings and optionally downsampled.
+    Where:
+    - Q (queries): What information is being sought
+    - K (keys): What information is available for matching
+    - V (values): The actual information content to be retrieved
+    - d_k: Key dimension for scaling (prevents saturation in softmax)
+    
+    Multi-Head Extension (from ViT paper):
+    MultiHead(Q,K,V) = Concat(head_1,...,head_h)W^O
+    where head_i = Attention(QW_i^Q, KW_i^K, VW_i^V)
+    
+    This allows the model to attend to different representation subspaces
+    simultaneously, capturing various types of relationships (e.g., spatial,
+    semantic, geometric) in parallel.
+    
+    Key Features for SAM2:
+    - Computational downsampling: Reduces memory from O(N²) to manageable levels
+    - Cross-modal support: Different input dimensions for prompt vs image features
+    - Hardware optimization: Automatic kernel selection (Flash Attention, etc.)
+    - Flexible projections: Adaptable to various feature dimensions
+    - Dropout regularization: Prevents overfitting during training
+    
+    The downsampling capability is crucial for processing high-resolution features
+    (e.g., 64x64 = 4096 tokens) without computational explosion, while maintaining
+    the essential attention patterns needed for accurate segmentation.
+    
+    Applications in SAM2:
+    - Prompt-to-image cross-attention for gathering visual context
+    - Image-to-prompt cross-attention for incorporating user intent
+    - Self-attention within prompt tokens for coordination
+    - Memory attention for temporal consistency in video processing
     """
 
     def __init__(
@@ -775,20 +810,37 @@ class Attention(nn.Module):
                 metadata={'component_type': 'attention', 'stage': 'attention_computation', 'tensor_type': 'weights', 'num_heads': self.num_heads}
             )
         
-        # Compute attention with hardware optimization
+        # Compute attention with hardware-optimized kernels for maximum efficiency
+        # This uses PyTorch's scaled_dot_product_attention which automatically selects
+        # the most efficient implementation based on hardware capabilities:
+        # 
+        # Flash Attention: Memory-efficient attention for modern GPUs
+        # - Reduces memory usage from O(N²) to O(N) through recomputation
+        # - Significantly faster on A100, H100, and similar architectures
+        # - Essential for processing high-resolution images and long sequences
+        # 
+        # Math Kernel: Standard attention implementation
+        # - Most compatible across different hardware
+        # - Required for older GPUs or when dropout is used during training
+        # - Provides numerical stability guarantees
+        # 
+        # Memory Efficient: Optimized for memory-constrained scenarios
+        # - Useful for inference on devices with limited GPU memory
+        # - Balances speed and memory usage
         try:
-            # Use optimized attention kernels when available (Flash Attention)
+            # Use optimized attention kernels with automatic selection
             with sdp_kernel_context(dropout_p):
                 out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
         except Exception as e:
-            # Graceful fallback if optimized kernels fail
+            # Graceful fallback ensures compatibility across all hardware
+            # This is crucial for deployment in diverse environments
             warnings.warn(
                 f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
                 f"kernels for scaled_dot_product_attention (which may have a slower speed).",
                 category=UserWarning,
                 stacklevel=2,
             )
-            # Enable all available kernels for compatibility
+            # Enable all available kernels for maximum compatibility
             global ALLOW_ALL_KERNELS
             ALLOW_ALL_KERNELS = True
             out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
@@ -820,26 +872,40 @@ class Attention(nn.Module):
 
 class RoPEAttention(Attention):
     """
-    Enhanced attention layer with Rotary Position Encoding (RoPE) for better spatial understanding.
+    Enhanced attention layer with Rotary Position Encoding (RoPE) for superior spatial understanding.
     
-    RoPE is an advanced positional encoding technique that directly encodes position
-    information into the attention computation by rotating query and key vectors.
-    This approach provides several advantages over traditional additive position encodings:
+    RoPE represents a significant advancement in positional encoding, originally proposed for
+    language models but particularly effective for vision tasks. Unlike traditional additive
+    position encodings used in Vision Transformers (arXiv:2010.11929), RoPE directly modifies
+    the attention computation by rotating query and key vectors in complex space.
     
-    Benefits of RoPE:
-    - Better relative position modeling
-    - Improved extrapolation to longer sequences
-    - More robust spatial understanding for 2D data
-    - Maintains rotation equivariance properties
+    Theoretical Foundation:
+    RoPE encodes position information by rotating feature vectors using:
+    q_m = R_m * q, k_n = R_n * k, where R_θ is a rotation matrix
+    This preserves relative position information: <q_m, k_n> depends only on (m-n)
     
-    This is particularly beneficial for vision tasks where spatial relationships
-    are crucial for accurate segmentation and object understanding.
+    Benefits over traditional Position Encoding (from ViT paper):
+    - Better relative position modeling: Natural encoding of spatial relationships
+    - Improved extrapolation: Works with sequence lengths not seen during training
+    - More robust spatial understanding: Direct integration into attention computation
+    - Rotation equivariance: Maintains consistency under coordinate transformations
+    - No additive interference: Doesn't compete with content representations
     
-    The implementation supports:
-    - 2D positional encoding for image features
-    - Flexible frequency computation for different resolutions
-    - Optional key repetition for cross-attention scenarios
-    - Partial RoPE application (excluding certain tokens)
+    Applications in SAM2:
+    - Spatial relationship modeling between image patches (similar to ViT improvements)
+    - Enhanced cross-attention for prompt-image alignment
+    - Better handling of multi-scale features in Feature Pyramid Networks
+    - Improved memory attention for temporal consistency (SAM2 innovation)
+    
+    This is crucial for video segmentation where spatial-temporal relationships
+    determine object tracking accuracy and consistency across frames.
+    
+    Implementation Features:
+    - 2D coordinate system support for image feature maps
+    - Flexible frequency computation for different input resolutions
+    - Optional key repetition for cross-attention to memory features
+    - Partial application (excluding non-spatial tokens like object pointers)
+    - Hardware-optimized computation with fallback compatibility
     """
 
     def __init__(

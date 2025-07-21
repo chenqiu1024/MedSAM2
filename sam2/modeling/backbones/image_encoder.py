@@ -4,6 +4,55 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Image Encoder for SAM2 - Vision Transformer Backbone with Feature Pyramid Network
+
+This module implements the core image encoding pipeline for SAM2, combining the power
+of Vision Transformers (ViT) for feature extraction with Feature Pyramid Networks (FPN)
+for multi-scale representation. The design is heavily influenced by foundational work:
+
+1. Vision Transformer (ViT) - "An Image Is Worth 16x16 Words" (arXiv:2010.11929)
+   - Revolutionized computer vision by applying transformers to image patches
+   - Treats images as sequences of patches processed through self-attention
+   - Achieves superior performance through global receptive fields
+   - SAM2 uses hierarchical ViT variants for dense prediction tasks
+
+2. Feature Pyramid Networks - Hierarchical feature representation
+   - Multi-scale feature extraction essential for object detection/segmentation
+   - Combines high-resolution spatial details with high-level semantic information
+   - Enables handling objects at different scales within the same image
+   - Critical for SAM2's ability to segment objects of varying sizes
+
+3. Masked Autoencoders (MAE) influence - "Masked Autoencoders Are Scalable Vision Learners" (arXiv:2111.06377)
+   - Asymmetric encoder-decoder design philosophy
+   - Heavy encoder (ViT backbone) for rich feature extraction
+   - Efficient processing through hierarchical feature selection
+   - SAM2 adopts similar principles for computational efficiency
+
+Architectural Components:
+
+**Trunk (ViT Backbone)**: 
+- Processes input images through patch embedding and transformer blocks
+- Generates hierarchical features at multiple resolutions (stride 4, 8, 16, 32)
+- Uses self-attention to capture global spatial relationships
+- Provides rich semantic representations for downstream processing
+
+**Neck (Feature Pyramid Network)**:
+- Combines multi-scale features through lateral connections and top-down pathways
+- Projects backbone features to consistent channel dimensions
+- Adds positional encodings for spatial awareness
+- Enables efficient multi-scale processing in SAM decoder
+
+**Integration Benefits**:
+- Global context from ViT attention mechanisms
+- Multi-scale spatial understanding from FPN design
+- Efficient feature representation for real-time video processing
+- Robust feature extraction across diverse image content and scales
+
+This encoder serves as the foundation for SAM2's visual understanding, providing
+the rich feature representations needed for accurate segmentation and temporal tracking.
+"""
+
 from typing import List, Optional
 
 import torch
@@ -12,18 +61,74 @@ import torch.nn.functional as F
 from efficient_track_anything.modeling.efficienttam_utils import LayerNorm2d
 
 
-
 class ImageEncoder(nn.Module):
+    """
+    Hierarchical image encoder combining Vision Transformer backbone with Feature Pyramid Network.
+    
+    This class orchestrates the complete image encoding pipeline for SAM2, consisting of:
+    
+    1. **ViT Trunk**: Hierarchical Vision Transformer for feature extraction
+       - Processes images through patch embedding and transformer blocks
+       - Generates multi-scale features through hierarchical attention
+       - Provides global spatial understanding through self-attention mechanisms
+    
+    2. **FPN Neck**: Feature Pyramid Network for multi-scale feature fusion
+       - Combines features across different scales through lateral connections
+       - Adds top-down pathways for feature enhancement
+       - Projects features to consistent dimensionality for downstream processing
+    
+    3. **Position Encoding**: Spatial position information injection
+       - Provides spatial awareness to transformer-based downstream modules
+       - Enables relative position understanding crucial for segmentation
+    
+    The encoder follows the hierarchical design principle from ViT while incorporating
+    FPN's multi-scale processing capabilities, resulting in rich feature representations
+    suitable for both image and video segmentation tasks.
+    """
     def __init__(
         self,
         trunk: nn.Module,
         neck: nn.Module,
         scalp: int = 0,
     ):
+        """
+        Initialize the hierarchical image encoder with Vision Transformer backbone.
+        
+        Args:
+            trunk (nn.Module): Vision Transformer backbone for feature extraction.
+                             Typically a hierarchical ViT (e.g., Hiera, ViT-Det) that
+                             generates multi-scale features through transformer blocks.
+                             Following ViT design from arXiv:2010.11929 with adaptations
+                             for dense prediction tasks.
+                             
+            neck (nn.Module): Feature Pyramid Network for multi-scale feature fusion.
+                            Combines trunk features through lateral connections and
+                            top-down pathways. Projects features to consistent dimensions
+                            and adds positional encodings for spatial awareness.
+                            
+            scalp (int): Number of lowest-resolution feature levels to discard.
+                       Used to reduce computational cost by removing the coarsest
+                       features that may not be needed for the specific task.
+                       Default 0 keeps all feature levels.
+        """
         super().__init__()
+        
+        # Vision Transformer backbone following ViT architecture principles
+        # Processes input images through patch embedding and transformer blocks
+        # Generates hierarchical features at multiple scales for comprehensive understanding
         self.trunk = trunk
+        
+        # Feature Pyramid Network for multi-scale feature integration
+        # Combines features across scales through lateral and top-down connections
+        # Essential for handling objects of different sizes within the same image
         self.neck = neck
+        
+        # Feature level selection for computational efficiency
+        # Allows discarding the coarsest features when not needed
         self.scalp = scalp
+        
+        # Validate consistency between trunk output and neck input dimensions
+        # Ensures proper feature flow through the encoder pipeline
         assert (
             self.trunk.channel_list == self.neck.backbone_channel_list
         ), f"Channel dims of trunk and neck do not match. Trunk: {self.trunk.channel_list}, neck: {self.neck.backbone_channel_list}"
@@ -111,9 +216,40 @@ class ImageEncoder(nn.Module):
 
 class FpnNeck(nn.Module):
     """
-    A modified variant of Feature Pyramid Network (FPN) neck
-    (we remove output conv and also do bicubic interpolation similar to ViT
-    pos embed interpolation)
+    Feature Pyramid Network (FPN) Neck for Multi-Scale Feature Integration in SAM2
+    
+    This class implements a modified Feature Pyramid Network that serves as the "neck"
+    component connecting the Vision Transformer backbone to the downstream SAM decoder.
+    The FPN design is crucial for SAM2's ability to segment objects at different scales
+    within the same image.
+    
+    **Theoretical Foundation:**
+    Feature Pyramid Networks address the fundamental challenge in computer vision of
+    handling objects at multiple scales. The key insight is that different network
+    layers capture different levels of abstraction:
+    - Early layers: High-resolution, low-level features (edges, textures)
+    - Late layers: Low-resolution, high-level features (semantic content)
+    
+    **FPN Architecture:**
+    1. **Lateral Connections**: Project each backbone level to common dimension
+    2. **Top-Down Pathway**: Propagate high-level semantics to high-resolution levels
+    3. **Feature Fusion**: Combine lateral and top-down features for rich representations
+    
+    **SAM2-Specific Modifications:**
+    - Removes output convolutions for efficiency (features fed directly to transformer)
+    - Uses bilinear interpolation consistent with ViT position embedding handling
+    - Integrates position encoding generation for spatial awareness
+    - Supports flexible feature level selection for computational optimization
+    
+    **Benefits for SAM2:**
+    - Enables segmentation of objects at vastly different scales
+    - Provides rich multi-scale features for the two-way transformer
+    - Maintains spatial resolution needed for precise mask boundaries
+    - Balances semantic understanding with spatial precision
+    
+    This FPN variant is specifically optimized for SAM2's transformer-based architecture,
+    providing the multi-scale visual representations essential for accurate segmentation
+    across diverse object sizes and image content.
     """
 
     def __init__(

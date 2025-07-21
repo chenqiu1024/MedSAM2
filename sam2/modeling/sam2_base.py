@@ -4,6 +4,58 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+SAM2 Base Model - Unified Architecture for Image and Video Segmentation
+
+This module implements the core SAM2 (Segment Anything Model 2) architecture, which extends
+the original SAM to handle both image and video segmentation with temporal consistency.
+SAM2 builds upon three foundational papers:
+
+1. Vision Transformer (ViT) - "An Image Is Worth 16x16 Words" (arXiv:2010.11929)
+   - Provides the core image encoder using self-attention over image patches
+   - Enables powerful visual feature extraction through transformer architecture
+   - SAM2 uses a modified ViT backbone with hierarchical features (Section 3.1)
+
+2. Masked Autoencoders (MAE) - "Masked Autoencoders Are Scalable Vision Learners" (arXiv:2111.06377)  
+   - Inspired the asymmetric encoder-decoder design philosophy
+   - Heavy encoder (ViT backbone) + lightweight decoder (mask head)
+   - Efficient processing by focusing computation on visible/relevant regions
+   - SAM2 adopts similar principles for efficient video processing
+
+3. SAM2 Paper - "SAM 2: Segment Anything in Images and Videos" (arXiv:2408.00714)
+   - Introduces memory attention mechanism for temporal consistency in videos
+   - Novel object pointer system for multi-object tracking
+   - Streaming architecture for real-time video processing
+   - Unified model handling both image and video segmentation tasks
+
+Core Architectural Innovations in SAM2:
+
+1. **Memory Attention System**: Novel temporal processing mechanism that maintains
+   object consistency across video frames by attending to compressed representations
+   of previous frames. Unlike traditional temporal models that require full sequences,
+   SAM2's memory bank enables efficient streaming processing.
+
+2. **Object Pointer Tokens**: Learned representations that encode object identity
+   and appearance, enabling the model to track multiple objects simultaneously
+   without explicit object ID management.
+
+3. **Hierarchical Feature Processing**: Multi-scale feature extraction and processing
+   inspired by Feature Pyramid Networks, enabling both coarse and fine-grained
+   segmentation control.
+
+4. **Prompt-Conditioned Segmentation**: Interactive segmentation through various
+   prompt types (points, boxes, masks) processed through dedicated encoders.
+
+5. **Streaming Architecture**: Designed for real-time video processing with
+   constant memory usage regardless of sequence length.
+
+The model consists of four main components:
+- Image Encoder: ViT-based backbone for visual feature extraction
+- Memory Attention: Temporal fusion of current frame with previous memories  
+- Memory Encoder: Compression of current predictions into memory representations
+- SAM Decoder: Prompt-conditioned mask generation with quality prediction
+"""
+
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -15,141 +67,253 @@ from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
 
-# a large negative value as a placeholder score for missing objects
+# Large negative value used as placeholder score for missing/occluded objects
+# This value is chosen to be sufficiently negative that sigmoid(-1024) ≈ 0
+# ensuring occluded objects don't contribute to segmentation
 NO_OBJ_SCORE = -1024.0
 
 
 class SAM2Base(torch.nn.Module):
+    """
+    SAM2 Base Model - Core Architecture for Video Object Segmentation
+    
+    This class implements the complete SAM2 architecture that unifies image and video
+    segmentation through a novel memory attention mechanism. The model extends the
+    original SAM's prompt-based segmentation to handle temporal sequences by maintaining
+    a memory bank of previous frame representations.
+    
+    Architectural Overview:
+    
+    1. **Image Backbone** (Vision Transformer from arXiv:2010.11929):
+       - Hierarchical ViT encoder producing multi-scale features
+       - Patch-based processing with self-attention
+       - Feature Pyramid Network for multi-resolution representations
+    
+    2. **Memory Attention** (Novel SAM2 innovation from arXiv:2408.00714):
+       - Temporally-aware feature processing using memory from previous frames
+       - Object pointer tokens for multi-object tracking
+       - Efficient streaming processing with constant memory usage
+    
+    3. **Memory Encoder** (Inspired by MAE asymmetric design from arXiv:2111.06377):
+       - Lightweight compression of current frame predictions into memory
+       - Selective encoding based on mask predictions and object presence
+       - Temporal positional encoding for frame ordering
+    
+    4. **SAM Decoder** (Extended from original SAM):
+       - Prompt encoder for points, boxes, and mask inputs
+       - Two-way transformer for prompt-image feature interaction
+       - Multi-mask output for handling ambiguous prompts
+       - Quality prediction through IoU estimation
+    
+    Key Design Principles:
+    
+    - **Streaming Efficiency**: Process videos frame-by-frame without storing full sequences
+    - **Memory Management**: Adaptive memory bank size with temporal locality
+    - **Multi-Object Support**: Track multiple objects through object pointer tokens
+    - **Prompt Flexibility**: Support various interaction modalities
+    - **Quality Awareness**: Predict and utilize segmentation quality scores
+    """
     def __init__(
         self,
         image_encoder,
         memory_attention,
         memory_encoder,
-        num_maskmem=7,  # default 1 input frame + 6 previous frames
+        num_maskmem=7,  # Memory bank size: 1 input frame + 6 previous frames (following XMem design)
         image_size=512,
-        backbone_stride=16,  # stride of the image backbone output
-        sigmoid_scale_for_mem_enc=1.0,  # scale factor for mask sigmoid prob
-        sigmoid_bias_for_mem_enc=0.0,  # bias factor for mask sigmoid prob
-        # During evaluation, whether to binarize the sigmoid mask logits on interacted frames with clicks
+        backbone_stride=16,  # Stride of image backbone output (typical for ViT-Base/16)
+        sigmoid_scale_for_mem_enc=1.0,  # Scale factor for mask sigmoid probabilities in memory encoding
+        sigmoid_bias_for_mem_enc=0.0,   # Bias factor for mask sigmoid probabilities in memory encoding
+        # During evaluation, whether to binarize sigmoid mask logits on interacted frames with clicks
+        # This creates hard binary masks for memory encoding vs soft probabilistic masks
         binarize_mask_from_pts_for_mem_enc=False,
-        use_mask_input_as_output_without_sam=False,  # on frames with mask input, whether to directly output the input mask without using a SAM prompt encoder + mask decoder
-        # The maximum number of conditioning frames to participate in the memory attention (-1 means no limit; if there are more conditioning frames than this limit,
-        # we only cross-attend to the temporally closest `max_cond_frames_in_attn` conditioning frames in the encoder when tracking each frame). This gives the model
-        # a temporal locality when handling a large number of annotated frames (since closer frames should be more important) and also avoids GPU OOM.
+        # On frames with mask input, whether to directly output the input mask without SAM processing
+        # Useful for ground truth supervision or when mask quality is already high
+        use_mask_input_as_output_without_sam=False,
+        # Maximum number of conditioning frames to participate in memory attention (-1 = no limit)
+        # Provides temporal locality when handling many annotated frames and prevents GPU OOM
+        # Following the principle that closer frames should be more important for current prediction
         max_cond_frames_in_attn=-1,
-        # on the first frame, whether to directly add the no-memory embedding to the image feature
-        # (instead of using the transformer encoder)
+        # On first frame, whether to directly add no-memory embedding to image features
+        # instead of using transformer encoder (efficiency optimization for initial frames)
         directly_add_no_mem_embed=False,
-        # whether to use high-resolution feature maps in the SAM mask decoder
+        # Whether to use high-resolution features in SAM mask decoder
+        # Enables finer segmentation details by incorporating multi-scale features
         use_high_res_features_in_sam=False,
-        # whether to output multiple (3) masks for the first click on initial conditioning frames
+        # Whether to output multiple (3) masks for first click on initial conditioning frames
+        # Helps handle ambiguous prompts by providing multiple hypotheses ranked by quality
         multimask_output_in_sam=False,
-        # the minimum and maximum number of clicks to use multimask_output_in_sam (only relevant when `multimask_output_in_sam=True`;
-        # default is 1 for both, meaning that only the first click gives multimask output; also note that a box counts as two points)
+        # Min/max number of clicks to use multimask output (box counts as 2 points)
+        # Controls when to provide multiple mask hypotheses vs single confident prediction
         multimask_min_pt_num=1,
         multimask_max_pt_num=1,
-        # whether to also use multimask output for tracking (not just for the first click on initial conditioning frames; only relevant when `multimask_output_in_sam=True`)
+        # Whether to use multimask output for tracking frames (not just initial conditioning)
+        # Can improve robustness but increases computational cost
         multimask_output_for_tracking=False,
-        # Whether to use multimask tokens for obj ptr; Only relevant when both
-        # use_obj_ptrs_in_encoder=True and multimask_output_for_tracking=True
+        # Whether to use multimask tokens for object pointer generation
+        # Only relevant when both use_obj_ptrs_in_encoder=True and multimask_output_for_tracking=True
         use_multimask_token_for_obj_ptr: bool = False,
-        # whether to use sigmoid to restrict ious prediction to [0-1]
+        # Whether to use sigmoid to restrict IoU predictions to [0,1] range
+        # Provides more interpretable quality scores
         iou_prediction_use_sigmoid=False,
-        # The memory bank's temporal stride during evaluation (i.e. the `r` parameter in XMem and Cutie; XMem and Cutie use r=5).
-        # For r>1, the (self.num_maskmem - 1) non-conditioning memory frames consist of
-        # (self.num_maskmem - 2) nearest frames from every r-th frames, plus the last frame.
+        # Memory bank temporal stride during evaluation (following XMem/Cutie with r=5)
+        # For r>1: (num_maskmem-1) non-conditioning frames = (num_maskmem-2) nearest r-th frames + last frame
+        # Balances memory coverage with computational efficiency
         memory_temporal_stride_for_eval=1,
-        # whether to apply non-overlapping constraints on the object masks in the memory encoder during evaluation (to avoid/alleviate superposing masks)
+        # Whether to apply non-overlapping constraints on object masks in memory encoder
+        # Prevents superposing masks during evaluation for cleaner multi-object tracking
         non_overlap_masks_for_mem_enc=False,
-        # whether to cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
+        # Whether to cross-attend to object pointers from other frames in encoder
+        # Enables multi-object tracking by sharing object identity information across frames
         use_obj_ptrs_in_encoder=False,
-        # the maximum number of object pointers from other frames in encoder cross attention (only relevant when `use_obj_ptrs_in_encoder=True`)
+        # Maximum number of object pointers from other frames in encoder cross attention
+        # Limits computational cost while providing sufficient object context
         max_obj_ptrs_in_encoder=16,
-        # whether to add temporal positional encoding to the object pointers in the encoder (only relevant when `use_obj_ptrs_in_encoder=True`)
+        # Whether to add temporal positional encoding to object pointers in encoder
+        # Helps model understand temporal relationships between object appearances
         add_tpos_enc_to_obj_ptrs=True,
-        # whether to add an extra linear projection layer for the temporal positional encoding in the object pointers to avoid potential interference
-        # with spatial positional encoding (only relevant when both `use_obj_ptrs_in_encoder=True` and `add_tpos_enc_to_obj_ptrs=True`)
+        # Whether to add extra linear projection for temporal positional encoding in object pointers
+        # Avoids potential interference with spatial positional encoding
         proj_tpos_enc_in_obj_ptrs=False,
-        # whether to use signed distance (instead of unsigned absolute distance) in the temporal positional encoding in the object pointers
-        # (only relevant when both `use_obj_ptrs_in_encoder=True` and `add_tpos_enc_to_obj_ptrs=True`)
+        # Whether to use signed distance (vs absolute) in temporal positional encoding
+        # Enables model to distinguish past vs future object pointers
         use_signed_tpos_enc_to_obj_ptrs=False,
-        # whether to only attend to object pointers in the past (before the current frame) in the encoder during evaluation
-        # (only relevant when `use_obj_ptrs_in_encoder=True`; this might avoid pointer information too far in the future to distract the initial tracking)
+        # Whether to only attend to object pointers in the past during evaluation
+        # Prevents future information leakage and improves initial tracking robustness
         only_obj_ptrs_in_the_past_for_eval=False,
-        # Whether to predict if there is an object in the frame
+        # Whether to predict object presence scores in addition to mask quality
+        # Useful for detecting when objects become occluded or leave the scene
         pred_obj_scores: bool = False,
-        # Whether to use an MLP to predict object scores
+        # Whether to use MLP instead of linear layer for object score prediction
+        # Provides more modeling capacity for complex object presence patterns
         pred_obj_scores_mlp: bool = False,
-        # Only relevant if pred_obj_scores=True and use_obj_ptrs_in_encoder=True;
-        # Whether to have a fixed no obj pointer when there is no object present
-        # or to use it as an additive embedding with obj_ptr produced by decoder
+        # Whether to use fixed no-object pointer vs additive embedding with decoder output
+        # Fixed: Use learned no-object embedding when object absent
+        # Additive: Mix no-object embedding with decoder output
         fixed_no_obj_ptr: bool = False,
-        # Soft no object, i.e. mix in no_obj_ptr softly,
-        # hope to make recovery easier if there is a mistake and mitigate accumulation of errors
+        # Soft no-object pointer mixing for easier error recovery
+        # Helps mitigate accumulation of tracking errors over long sequences
         soft_no_obj_ptr: bool = False,
+        # Whether to use MLP for object pointer projection (vs simple linear layer)
+        # Provides more modeling capacity for object pointer generation
         use_mlp_for_obj_ptr_proj: bool = False,
-        # add no obj embedding to spatial frames
+        # Whether to add no-object embedding to spatial frames
+        # Helps model learn to handle frames without target objects
         no_obj_embed_spatial: bool = False,
-        # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
+        # Extra arguments for SAM mask decoder construction
+        # Allows customization of decoder architecture and hyperparameters
         sam_mask_decoder_extra_args=None,
+        # Whether to compile image encoder for faster inference
+        # Uses PyTorch 2.0 compilation for optimization (first forward pass will be slow)
         compile_image_encoder: bool = False,
     ):
         super().__init__()
 
-        # Part 1: the image backbone
+        # ========================================================================
+        # Part 1: Image Backbone (Vision Transformer from arXiv:2010.11929)
+        # ========================================================================
+        # The image encoder is typically a hierarchical Vision Transformer that
+        # processes input images through patch embedding and self-attention layers.
+        # Following ViT design principles with adaptations for dense prediction tasks:
+        # - Patch tokenization converts 2D images to 1D sequences
+        # - Multi-head self-attention captures spatial relationships
+        # - Feature Pyramid Network provides multi-scale representations
         self.image_encoder = image_encoder
-        # Use level 0, 1, 2 for high-res setting, or just level 2 for the default setting
+        
+        # Multi-scale feature configuration following Feature Pyramid Network design
+        # Use levels 0,1,2 for high-res setting (finer details) or just level 2 for default
+        # This provides hierarchical feature representations at different scales
         self.use_high_res_features_in_sam = use_high_res_features_in_sam
         self.num_feature_levels = 3 if use_high_res_features_in_sam else 1
+        
+        # Object pointer configuration for multi-object tracking
+        # Object pointers are learned representations that encode object identity and appearance
+        # enabling the model to track multiple objects without explicit ID management
         self.use_obj_ptrs_in_encoder = use_obj_ptrs_in_encoder
         self.max_obj_ptrs_in_encoder = max_obj_ptrs_in_encoder
         if use_obj_ptrs_in_encoder:
-            # A conv layer to downsample the mask prompt to stride 4 (the same stride as
-            # low-res SAM mask logits) and to change its scales from 0~1 to SAM logit scale,
-            # so that it can be fed into the SAM mask decoder to generate a pointer.
+            # Downsample mask prompts to stride 4 (same as low-res SAM mask logits)
+            # and convert scales from [0,1] to SAM logit scale for decoder compatibility
+            # This enables mask prompts to be processed as object pointers
             self.mask_downsample = torch.nn.Conv2d(1, 1, kernel_size=4, stride=4)
+            
+        # Temporal positional encoding configuration for object pointers
+        # This helps the model understand temporal relationships between object appearances
+        # across different frames, crucial for maintaining identity consistency
         self.add_tpos_enc_to_obj_ptrs = add_tpos_enc_to_obj_ptrs
         if proj_tpos_enc_in_obj_ptrs:
-            assert add_tpos_enc_to_obj_ptrs  # these options need to be used together
+            assert add_tpos_enc_to_obj_ptrs  # Projection requires temporal encoding
         self.proj_tpos_enc_in_obj_ptrs = proj_tpos_enc_in_obj_ptrs
         self.use_signed_tpos_enc_to_obj_ptrs = use_signed_tpos_enc_to_obj_ptrs
         self.only_obj_ptrs_in_the_past_for_eval = only_obj_ptrs_in_the_past_for_eval
 
-        # Part 2: memory attention to condition current frame's visual features
-        # with memories (and obj ptrs) from past frames
+        # ========================================================================
+        # Part 2: Memory Attention (Novel SAM2 Innovation from arXiv:2408.00714)
+        # ========================================================================
+        # Memory attention enables temporal consistency by conditioning current frame
+        # features on compressed representations from previous frames. This is a key
+        # innovation that distinguishes SAM2 from image-only segmentation models.
+        # The mechanism maintains a memory bank of past frame information and uses
+        # cross-attention to integrate relevant temporal context.
         self.memory_attention = memory_attention
         self.hidden_dim = image_encoder.neck.d_model
 
-        # Part 3: memory encoder for the previous frame's outputs
+        # ========================================================================  
+        # Part 3: Memory Encoder (Inspired by MAE asymmetric design from arXiv:2111.06377)
+        # ========================================================================
+        # The memory encoder compresses current frame outputs into compact representations
+        # for storage in the memory bank. Following MAE's asymmetric encoder-decoder philosophy:
+        # - Lightweight encoder focuses on essential information compression
+        # - Selective encoding based on mask predictions and object presence
+        # - Efficient storage of temporal information for future frames
         self.memory_encoder = memory_encoder
         self.mem_dim = self.hidden_dim
         if hasattr(self.memory_encoder, "out_proj") and hasattr(
             self.memory_encoder.out_proj, "weight"
         ):
-            # if there is compression of memories along channel dim
+            # Handle memory compression along channel dimension if present
+            # Reduces memory footprint while preserving essential information
             self.mem_dim = self.memory_encoder.out_proj.weight.shape[0]
-        self.num_maskmem = num_maskmem  # Number of memories accessible
-        # Temporal encoding of the memories
+            
+        # Memory bank configuration following successful video segmentation approaches
+        # Number of accessible memories (typically 7: 1 input + 6 previous frames)
+        # This follows XMem design principles for effective temporal modeling
+        self.num_maskmem = num_maskmem
+        
+        # Temporal positional encoding for memory frames
+        # Each memory frame gets a unique temporal position encoding to indicate
+        # its relative position in time. This helps the model understand temporal ordering.
         self.maskmem_tpos_enc = torch.nn.Parameter(
             torch.zeros(num_maskmem, 1, 1, self.mem_dim)
         )
         trunc_normal_(self.maskmem_tpos_enc, std=0.02)
-        # a single token to indicate no memory embedding from previous frames
+        
+        # No-memory embeddings for initial frames without previous context
+        # These learned embeddings replace actual memory when no previous frames exist
+        # ensuring consistent input dimensions to the memory attention mechanism
         self.no_mem_embed = torch.nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
         self.no_mem_pos_enc = torch.nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
         trunc_normal_(self.no_mem_embed, std=0.02)
         trunc_normal_(self.no_mem_pos_enc, std=0.02)
         self.directly_add_no_mem_embed = directly_add_no_mem_embed
-        # Apply sigmoid to the output raw mask logits (to turn them from
-        # range (-inf, +inf) to range (0, 1)) before feeding them into the memory encoder
+        
+        # Memory encoding parameters for mask processing
+        # Apply sigmoid to raw mask logits before memory encoding
+        # Scale and bias terms control the dynamic range of sigmoid probabilities
+        # This preprocessing ensures stable and effective memory representations
         self.sigmoid_scale_for_mem_enc = sigmoid_scale_for_mem_enc
         self.sigmoid_bias_for_mem_enc = sigmoid_bias_for_mem_enc
         self.binarize_mask_from_pts_for_mem_enc = binarize_mask_from_pts_for_mem_enc
         self.non_overlap_masks_for_mem_enc = non_overlap_masks_for_mem_enc
         self.memory_temporal_stride_for_eval = memory_temporal_stride_for_eval
-        # On frames with mask input, whether to directly output the input mask without
-        # using a SAM prompt encoder + mask decoder
+        
+        # Direct mask output option for high-quality mask inputs
+        # When input masks are already high quality (e.g., ground truth), 
+        # skip SAM processing for efficiency
         self.use_mask_input_as_output_without_sam = use_mask_input_as_output_without_sam
+        
+        # Multi-mask output configuration for handling ambiguity
+        # Provides multiple mask hypotheses when prompts are ambiguous
+        # Following SAM design principles for robust interactive segmentation
         self.multimask_output_in_sam = multimask_output_in_sam
         self.multimask_min_pt_num = multimask_min_pt_num
         self.multimask_max_pt_num = multimask_max_pt_num
@@ -157,33 +321,60 @@ class SAM2Base(torch.nn.Module):
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
         self.iou_prediction_use_sigmoid = iou_prediction_use_sigmoid
 
-        # Part 4: SAM-style prompt encoder (for both mask and point inputs)
-        # and SAM-style mask decoder for the final mask output
+        # ========================================================================
+        # Part 4: SAM-style Prompt Encoder and Mask Decoder (Extended from original SAM)
+        # ========================================================================
+        # These components handle prompt processing and final mask generation
+        # following the original SAM design with extensions for video understanding
         self.image_size = image_size
         self.backbone_stride = backbone_stride
         self.sam_mask_decoder_extra_args = sam_mask_decoder_extra_args
+        
+        # Object score prediction for tracking applications
+        # Predicts whether objects are present/visible in current frame
+        # Essential for handling occlusions and object re-appearances
         self.pred_obj_scores = pred_obj_scores
         self.pred_obj_scores_mlp = pred_obj_scores_mlp
         self.fixed_no_obj_ptr = fixed_no_obj_ptr
         self.soft_no_obj_ptr = soft_no_obj_ptr
+        
+        # Validation: fixed no-object pointer requires object score prediction and encoder pointer usage
         if self.fixed_no_obj_ptr:
             assert self.pred_obj_scores
             assert self.use_obj_ptrs_in_encoder
+            
+        # No-object pointer for handling object absence/occlusion
+        # Learned representation indicating when target object is not present
+        # Crucial for robust tracking through occlusions and scene changes
         if self.pred_obj_scores and self.use_obj_ptrs_in_encoder:
             self.no_obj_ptr = torch.nn.Parameter(torch.zeros(1, self.hidden_dim))
             trunc_normal_(self.no_obj_ptr, std=0.02)
+            
+        # Object pointer projection configuration
+        # Controls how SAM output tokens are converted to object pointers
         self.use_mlp_for_obj_ptr_proj = use_mlp_for_obj_ptr_proj
+        
+        # Spatial no-object embedding for frames without target objects
+        # Added to spatial memory features to indicate object absence
         self.no_obj_embed_spatial = None
         if no_obj_embed_spatial:
             self.no_obj_embed_spatial = torch.nn.Parameter(torch.zeros(1, self.mem_dim))
             trunc_normal_(self.no_obj_embed_spatial, std=0.02)
 
+        # Build SAM-style prompt encoder and mask decoder components
         self._build_sam_heads()
+        
+        # Attention mechanism configuration
+        # Limits number of conditioning frames to prevent computational explosion
+        # and maintain temporal locality bias (closer frames more important)
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
 
-        # Model compilation
+        # ========================================================================
+        # Model Compilation (PyTorch 2.0 Optimization)
+        # ========================================================================
+        # Optional compilation for faster inference (first forward pass will be slow)
+        # Uses PyTorch 2.0's compilation system for automatic optimization
         if compile_image_encoder:
-            # Compile the forward function (not the full module) to allow loading checkpoints.
             print(
                 "Image encoder compilation is enabled. First forward pass will be slow."
             )

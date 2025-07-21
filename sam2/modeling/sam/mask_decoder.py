@@ -138,12 +138,32 @@ class MaskDecoder(nn.Module):
         # Multi-mask configuration
         self.num_multimask_outputs = num_multimask_outputs
 
-        # Learnable output tokens that guide mask generation
-        # IoU token: generates features for mask quality prediction
+        # ========================================================================
+        # Learnable Output Tokens - Core Innovation of SAM's Mask Decoder
+        # ========================================================================
+        # These tokens encode different mask generation strategies as learnable embeddings.
+        # Unlike traditional decoders that use fixed architectures, SAM's approach allows
+        # the model to dynamically adapt its mask generation based on the prompt context.
+        # 
+        # Theoretical Foundation:
+        # This design draws inspiration from several key concepts:
+        # 1. **Attention as Dynamic Routing** (from Vision Transformer paper - arXiv:2010.11929):
+        #    Tokens can gather information selectively through attention mechanisms
+        # 2. **Hypernetworks** - Networks that generate parameters for other networks:
+        #    Each mask token will generate its own mask prediction network parameters
+        # 3. **Multi-hypothesis Generation**: Following computer vision best practices
+        #    for handling ambiguous inputs by generating multiple plausible outputs
+        
+        # IoU Token: Specialized for mask quality prediction
+        # This token learns to assess mask quality by attending to image-prompt alignment
+        # It outputs features that feed into the IoU prediction head
         self.iou_token = nn.Embedding(1, transformer_dim)
         
-        # Mask tokens: each generates a different mask hypothesis
+        # Mask Tokens: Each encodes a different mask generation strategy
+        # - Single-mask token (index 0): Best single prediction for unambiguous prompts
+        # - Multi-mask tokens (indices 1-3): Multiple hypotheses for ambiguous prompts
         # Total tokens = multi-mask outputs + 1 single-mask output
+        # This enables the model to handle both clear and ambiguous segmentation scenarios
         self.num_mask_tokens = num_multimask_outputs + 1
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, transformer_dim)
 
@@ -154,16 +174,38 @@ class MaskDecoder(nn.Module):
             self.obj_score_token = nn.Embedding(1, transformer_dim)
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
 
-        # Progressive upsampling network for mask resolution enhancement
-        # Transforms low-resolution transformer output to high-resolution masks
+        # ========================================================================
+        # Progressive Upsampling Network - Lightweight Decoder Design
+        # ========================================================================
+        # This component implements the "asymmetric encoder-decoder" philosophy from
+        # Masked Autoencoders (MAE) paper (arXiv:2111.06377), where the heavy computation
+        # is concentrated in the encoder (ViT backbone + transformer) while the decoder
+        # (this upsampling network) is kept lightweight and efficient.
+        #
+        # **Design Philosophy:**
+        # "The asymmetric design allows us to train large encoders very efficiently"
+        # - MAE paper. SAM adopts this principle: heavy Vision Transformer encoder
+        # extracts rich features, lightweight decoder generates high-resolution output.
+        #
+        # **Progressive Upsampling Strategy:**
+        # Starting from transformer output (typically 32x32 for 512x512 image):
+        # 1. First stage: 32x32 → 64x64 (2x upsampling)
+        # 2. Second stage: 64x64 → 128x128 (4x total upsampling)
+        # Final resolution: 128x128 for 512x512 input (1/4 of original)
+        #
+        # **Layer Normalization Choice:**
+        # Uses LayerNorm2d instead of BatchNorm to maintain consistency with
+        # transformer architecture and provide better stability during training.
+        # This follows the normalization strategy from Vision Transformers.
         self.output_upscaling = nn.Sequential(
-            # First upsampling stage: 2x spatial increase
+            # First upsampling stage: 2x spatial increase with dimension reduction
             nn.ConvTranspose2d(
                 transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
             ),
-            LayerNorm2d(transformer_dim // 4),  # Stabilize training
+            LayerNorm2d(transformer_dim // 4),  # Stable training, consistent with ViT
             activation(),
             # Second upsampling stage: another 2x spatial increase (4x total)
+            # Further dimension reduction for computational efficiency
             nn.ConvTranspose2d(
                 transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2
             ),
@@ -181,8 +223,36 @@ class MaskDecoder(nn.Module):
                 transformer_dim, transformer_dim // 4, kernel_size=1, stride=1
             )
 
-        # Hypernetwork: each mask token generates its own prediction network
-        # This enables adaptive computation based on the specific mask token
+        # ========================================================================
+        # Hypernetwork Architecture - Dynamic Mask Generation Networks
+        # ========================================================================
+        # This is a key innovation that makes SAM's mask decoder highly adaptive.
+        # Instead of using a fixed mask prediction network, each mask token generates
+        # the parameters for its own specialized mask prediction network.
+        #
+        # **Hypernetwork Concept:**
+        # A hypernetwork is a neural network that generates weights for another network.
+        # Here, each mask token (after processing through the transformer) outputs
+        # parameters for a convolutional mask prediction operation.
+        #
+        # **Advantages over Fixed Architectures:**
+        # 1. **Adaptive Computation**: Different tokens can specialize in different types
+        #    of masks (e.g., fine-grained vs coarse, single object vs multiple objects)
+        # 2. **Parameter Efficiency**: Shared computation in transformer, specialized
+        #    generation in hypernetwork (inspired by MAE's asymmetric design)
+        # 3. **Multi-hypothesis Generation**: Natural way to produce multiple diverse
+        #    mask predictions from the same input
+        # 4. **Quality-aware Generation**: Each mask comes with its own generation
+        #    strategy, enabling better quality assessment
+        #
+        # **Mathematical Operation:**
+        # For mask token i with features t_i ∈ R^D:
+        # 1. Generate parameters: w_i = MLP_i(t_i) ∈ R^(D/8)
+        # 2. Apply to features: mask_i = w_i^T · upscaled_features
+        # 3. Result: Dynamic convolution specialized for token i's strategy
+        #
+        # This approach enables the model to learn different mask generation strategies
+        # end-to-end, rather than being constrained to a single fixed approach.
         self.output_hypernetworks_mlps = nn.ModuleList(
             [
                 MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)

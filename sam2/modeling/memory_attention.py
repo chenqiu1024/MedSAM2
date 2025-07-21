@@ -129,8 +129,14 @@ class MemoryAttentionLayer(nn.Module):
         self.dim_feedforward = dim_feedforward
         self.dropout_value = dropout
         
-        # Attention modules
+        # Attention modules implementing the two-stage temporal reasoning architecture
+        # Stage 1: Self-attention for spatial reasoning within current frame
+        # Following Vision Transformer design (arXiv:2010.11929) for spatial modeling
         self.self_attn = self_attention          # Current frame self-attention
+        
+        # Stage 2: Cross-attention for temporal reasoning with memory bank
+        # Novel SAM2 innovation (arXiv:2408.00714) enabling video understanding
+        # Memory cross-attention allows selective retrieval of relevant temporal information
         self.cross_attn_image = cross_attention  # Memory cross-attention
 
         # Feed-forward network for non-linear transformation
@@ -188,24 +194,54 @@ class MemoryAttentionLayer(nn.Module):
 
     def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0):
         """
-        Forward pass for cross-attention between current frame and memory.
+        Forward pass for temporal cross-attention - the core innovation of SAM2.
         
-        This method integrates information from the memory bank into current
-        frame features, enabling temporal consistency and object tracking
-        across video frames. The cross-attention allows selective retrieval
-        of relevant past information.
+        This method implements the novel memory attention mechanism that enables SAM2
+        to maintain temporal consistency across video frames. Unlike traditional video
+        models that process entire sequences, SAM2's memory bank approach provides:
+        
+        **Key Innovations (from SAM2 paper - arXiv:2408.00714):**
+        - Streaming video processing with constant memory usage
+        - Selective memory retrieval based on visual similarity  
+        - Object pointer tokens for multi-object tracking
+        - Compressed memory representations for efficiency
+        
+        **Cross-Attention Mechanism:**
+        The temporal cross-attention operates as Query-Key-Value attention where:
+        - Queries: Current frame features seeking temporal context
+        - Keys: Memory features providing matching candidates  
+        - Values: Memory content to be retrieved and integrated
+        
+        This enables the model to:
+        - Find relevant past information for current frame understanding
+        - Maintain object identity across temporal gaps
+        - Handle occlusions and re-appearances robustly
+        - Support multi-object tracking through separate memory banks
         
         Args:
-            tgt (torch.Tensor): Current frame features (queries)
-            memory (torch.Tensor): Memory bank features (keys and values)
-            query_pos (torch.Tensor): Position encoding for current frame
+            tgt (torch.Tensor): Current frame features (queries) [seq_len, batch, d_model]
+                              Features from the current frame seeking temporal context
+                              
+            memory (torch.Tensor): Memory bank features (keys/values) [mem_len, batch, d_model]
+                                 Compressed representations from previous frames containing:
+                                 - Visual features from past frames
+                                 - Object pointer tokens for tracking
+                                 - Spatial memory from mask predictions
+                                 
+            query_pos (torch.Tensor): Position encoding for current frame features
+                                     Provides spatial context for current frame queries
+                                     
             pos (torch.Tensor): Position encoding for memory features
-            num_k_exclude_rope (int): Number of keys to exclude from RoPE encoding
-                                    Used for object pointer tokens that don't need
-                                    spatial position encoding
+                              Includes both spatial and temporal position information
+                              for memory bank organization
+                              
+            num_k_exclude_rope (int): Number of memory keys to exclude from RoPE encoding
+                                    Used for object pointer tokens that represent semantic
+                                    rather than spatial information (don't need spatial encoding)
             
         Returns:
-            torch.Tensor: Memory-enhanced features with residual connection
+            torch.Tensor: Memory-enhanced current frame features with temporal context
+                         Same shape as input tgt [seq_len, batch, d_model]
         """
         # Prepare keyword arguments for RoPE attention if needed
         kwds = {}
@@ -237,33 +273,64 @@ class MemoryAttentionLayer(nn.Module):
         num_k_exclude_rope: int = 0,
     ) -> torch.Tensor:
         """
-        Complete forward pass through memory attention layer.
+        Complete forward pass implementing SAM2's novel temporal attention architecture.
         
-        Processes current frame features through self-attention, integrates
-        memory information via cross-attention, and applies feed-forward
-        transformation. The three-stage architecture enables both spatial
-        and temporal reasoning.
+        This method orchestrates a three-stage processing pipeline that combines spatial
+        and temporal reasoning for robust video object segmentation:
+        
+        1. **Spatial Self-Attention**: Processes current frame spatial relationships
+           (inspired by Vision Transformer spatial modeling - arXiv:2010.11929)
+           
+        2. **Temporal Cross-Attention**: Integrates memory from previous frames
+           (novel SAM2 innovation - arXiv:2408.00714)
+           
+        3. **Non-Linear Processing**: Feature refinement through MLPs
+           (following Transformer and MAE design principles - arXiv:2111.06377)
+        
+        This architecture enables the model to:
+        - Understand spatial relationships within the current frame
+        - Maintain temporal consistency with previous frames
+        - Handle object occlusions and re-appearances
+        - Track multiple objects simultaneously through memory tokens
         
         Args:
-            tgt (torch.Tensor): Current frame features to process
-            memory (torch.Tensor): Memory bank from previous frames
+            tgt (torch.Tensor): Current frame features to process [seq_len, batch, d_model]
+                              These represent the current visual state requiring temporal context
+                              
+            memory (torch.Tensor): Memory bank from previous frames [mem_len, batch, d_model]
+                                 Compressed representations from the memory encoder containing
+                                 essential information from past frames and object states
+                                 
             pos (torch.Tensor, optional): Position encoding for memory features
+                                        Provides spatial context for memory tokens
+                                        
             query_pos (torch.Tensor, optional): Position encoding for current features
-            num_k_exclude_rope (int): Number of memory keys to exclude from RoPE
+                                              Enables spatial awareness in current frame
+                                              
+            num_k_exclude_rope (int): Number of memory keys to exclude from RoPE encoding
+                                    Used for object pointer tokens that represent semantic
+                                    rather than spatial information
             
         Returns:
-            torch.Tensor: Enhanced features combining current frame and memory information
+            torch.Tensor: Enhanced features combining spatial and temporal understanding
+                         Same shape as input tgt [seq_len, batch, d_model]
         """
-        # Stage 1: Self-attention on current frame for spatial reasoning
+        # Stage 1: Spatial Self-Attention (following ViT design principles)
+        # Enables the model to understand spatial relationships within the current frame
+        # This stage processes features similar to standard Vision Transformer layers
         tgt = self._forward_sa(tgt, query_pos)
         
-        # Stage 2: Cross-attention to memory for temporal integration  
+        # Stage 2: Temporal Cross-Attention (novel SAM2 innovation)
+        # Integrates information from the memory bank to maintain temporal consistency
+        # This is the key innovation that enables video understanding in SAM2
         tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
         
-        # Stage 3: Feed-forward network for non-linear transformation
+        # Stage 3: Feed-Forward Network (standard Transformer component)
+        # Non-linear transformation for feature refinement, following the design
+        # from both Vision Transformer and MAE architectures
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
+        tgt = tgt + self.dropout3(tgt2)  # Residual connection for stable training
         
         return tgt
 
